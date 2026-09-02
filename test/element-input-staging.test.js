@@ -14,12 +14,16 @@ const style = fs.readFileSync(path.join(__dirname, '..', 'public', 'style.css'),
 
 test('generation submission stages Element inputs before posting a prompt', () => {
   assert.match(server, /async function queuePrompt\(graph, options = \{\}\) \{[\s\S]*?await stageElementInputs\(\{[\s\S]*?uploadFile: uploadFileToComfy,[\s\S]*?comfyFetch\('\/prompt'/);
-  assert.match(server, /queueGenerationJob[\s\S]*?const elementInputNames = \(p\.elementsUsed \|\| \[\]\)\.flatMap[\s\S]*?queuePrompt\(graph, \{ profileId, elementInputNames, workflowContractId \}\)/);
+  assert.match(server, /queueGenerationJob[\s\S]*?const pid = crypto\.randomUUID\(\)[\s\S]*?trackJob\(pid, job\)[\s\S]*?submitDurableGeneration\(pid, job\)/);
+  assert.match(server, /submitDurableGeneration[\s\S]*?submissionState: 'staging'[\s\S]*?stageQueuedElementInputs\(job\)[\s\S]*?submissionState: 'submitting'[\s\S]*?queuePrompt\(job\.graph,[\s\S]*?promptId: pid/);
   assert.match(server, /queuePrompt\(graph, options = \{\}\)[\s\S]*?assertWorkflowCapability\(options\.workflowContractId, graph, await getObjectInfo\(\)\)/);
+  assert.match(server, /if \(stablePromptId\) body\.prompt_id = stablePromptId/);
+  assert.ok(server.indexOf('trackJob(pid, job)') < server.indexOf('submitDurableGeneration(pid, job)'), 'intent is durable before staging or submission');
 });
 
 test('Element input manifests survive restart recovery and queue reorder', () => {
   assert.match(server, /requeueMissingDurableJob[\s\S]*?elementInputNames: job\.elementInputNames/);
+  assert.match(server, /requeueMissingDurableJob[\s\S]*?promptId: pid[\s\S]*?nextJobId: pid/);
   const reorder = server.slice(server.indexOf("route === '/api/queue/reorder'"), server.indexOf("route === '/api/queue/cancel'"));
   assert.ok(reorder.indexOf('stageQueuedElementInputs') < reorder.indexOf('body: JSON.stringify({ delete: pendingIds })'));
   assert.match(reorder, /elementInputNames: job\.elementInputNames/);

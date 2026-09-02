@@ -19,6 +19,43 @@ test('generation jobs survive a new journal instance and disappear on completion
   assert.deepEqual(createJobJournal(file).entries(), []);
 });
 
+test('stable submission lifecycle survives restart before Comfy acknowledgement', (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'mix-job-journal-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const file = path.join(root, 'pending.json');
+  const operationId = '4ecfc3f0-ea78-4e8e-b1e4-7fbf13e24a74';
+  const job = {
+    kind: 'gen', profileId: 'owner', params: { prompt: 'test' }, graph: { save: {} },
+    operationId, promptId: operationId, submissionState: 'submitting',
+    submissionAttemptId: '0f6df3a6-b7e0-448d-b2fb-186d05515bd4', submitStartedAt: 123,
+    cancelRequested: true, cancelRequestedAt: 124, cancelMessage: 'Cancelled by user',
+  };
+  assert.equal(createJobJournal(file).put(operationId, job), true);
+  const restored = createJobJournal(file).entries()[0][1];
+  assert.equal(restored.operationId, operationId);
+  assert.equal(restored.promptId, operationId);
+  assert.equal(restored.submissionState, 'submitting');
+  assert.equal(restored.submissionAttemptId, job.submissionAttemptId);
+  assert.equal(restored.cancelRequested, true);
+  assert.equal(restored.cancelRequestedAt, 124);
+});
+
+test('legacy durable jobs adopt their journal key as stable operation identity', (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'mix-job-journal-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const file = path.join(root, 'pending.json');
+  fs.writeFileSync(file, JSON.stringify({
+    version: 1,
+    jobs: [{ id: 'legacy-prompt', job: {
+      kind: 'gen', profileId: 'owner', params: { prompt: 'legacy' }, graph: { save: {} },
+    } }],
+  }));
+  const restored = createJobJournal(file).entries()[0][1];
+  assert.equal(restored.operationId, 'legacy-prompt');
+  assert.equal(restored.promptId, 'legacy-prompt');
+  assert.equal(restored.submissionState, 'submitted');
+});
+
 test('ephemeral jobs are not persisted', (t) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'mix-job-journal-'));
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));

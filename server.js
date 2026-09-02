@@ -78,6 +78,7 @@ const { discoverModels } = require('./installer/model-discovery');
 const { restartComfy, restartStatus, startComfy, startStatus } = require('./lib/comfy-restart');
 const { discoverComfyEndpoints, probeComfyUrl } = require('./lib/comfy-discovery');
 const { assertVerifiedComfyRuntime, attestComfyEndpoint } = require('./lib/comfy-runtime-identity');
+const { decideComfySubmission } = require('./lib/comfy-submission-reconciler');
 const { assertWorkflowCapability } = require('./lib/workflow-capabilities');
 const {
   normalizeGenerationDefaults,
@@ -1418,6 +1419,14 @@ function trackJob(pid, job) {
   jobs.set(pid, Object.assign({ enqueuedAt: now, startedAt: null }, job));
 }
 
+function persistJob(pid, patch = {}) {
+  const job = jobs.get(pid);
+  if (!job) return null;
+  Object.assign(job, patch);
+  jobs.set(pid, job);
+  return job;
+}
+
 function jobBaseTime(job) {
   return job && (job.startedAt || job.enqueuedAt || job.createdAt) || Date.now();
 }
@@ -1439,41 +1448,60 @@ async function requeueMissingDurableJob(pid, job) {
     itemId: job.itemId || null,
   });
   try {
+    persistJob(pid, {
+      submissionState: 'reconciling',
+      lastReconciledAt: Date.now(),
+    });
     const nextPid = await queuePrompt(job.graph, {
       profileId: job.profileId,
       elementInputNames: job.elementInputNames,
       workflowContractId: job.workflowContractId,
+      promptId: pid,
+      localState: job.submissionState,
     });
-    jobs.delete(pid);
-    const replacement = Object.assign(job, {
-      enqueuedAt: Date.now(),
+    if (nextPid !== pid) {
+      const error = new Error('ComfyUI changed the stable ID for a preserved generation.');
+      error.code = 'comfy_prompt_id_mismatch';
+      throw error;
+    }
+    persistJob(pid, {
       startedAt: null,
-      requeuedFrom: pid,
       requeueing: false,
+      submissionState: 'submitted',
+      submittedAt: Date.now(),
+      lastReconciledAt: Date.now(),
     });
-    delete replacement.missingFromComfyAt;
-    delete replacement.recoveryError;
-    trackJob(nextPid, replacement);
-    updateSmartChunkJob(replacement, nextPid, 0, 1);
+    delete job.missingFromComfyAt;
+    delete job.recoveryError;
+    jobs.set(pid, job);
+    updateSmartChunkJob(job, pid, 0, 1);
     ensureWs();
-    broadcast('jobRequeued', { jobId: pid, nextJobId: nextPid, profileId: job.profileId });
+    broadcast('jobRequeued', { jobId: pid, nextJobId: pid, profileId: job.profileId });
     return true;
   } catch (error) {
-    job.requeueing = false;
-    job.missingFromComfyAt = Date.now();
+    const decision = error?.submissionDecision;
+    const needsAttention = decision?.state === 'attention'
+      || ['element_asset_missing', 'element_asset_unavailable', 'comfy_prompt_id_mismatch'].includes(error?.code);
     const elementNeedsAttention = ['element_asset_missing', 'element_asset_unavailable'].includes(error?.code);
-    job.recoveryError = elementNeedsAttention ? {
+    persistJob(pid, {
+      requeueing: false,
+      missingFromComfyAt: Date.now(),
+      submissionState: needsAttention ? 'attention' : 'submission_unknown',
+      lastReconciledAt: Date.now(),
+      recoveryError: needsAttention ? {
       code: error.code,
       message: String(error.message || error),
       attentionRequired: true,
-    } : undefined;
-    localJobJournal.put(pid, job);
+      } : undefined,
+    });
     broadcast('status', {
       jobId: pid,
       profileId: job.profileId,
       kind: job.kind,
-      text: elementNeedsAttention
-        ? String(error.message || 'This preserved generation needs its Element image replaced.')
+      text: needsAttention
+        ? String(error.message || (elementNeedsAttention
+          ? 'This preserved generation needs its Element image replaced.'
+          : 'This preserved generation needs attention before it can continue.'))
         : 'Waiting for ComfyUI to accept the preserved generation…',
       itemId: job.itemId || null,
     });
@@ -1593,9 +1621,49 @@ async function comfyFetch(p, opts) {
   }
   if (!res.ok) {
     const text = await res.text().catch(() => '');
-    throw new Error(`ComfyUI ${p} -> ${res.status} ${text.slice(0, 400)}`);
+    const wrapped = new Error(`ComfyUI ${p} -> ${res.status} ${text.slice(0, 400)}`);
+    wrapped.code = 'comfy_http_error';
+    wrapped.status = res.status;
+    throw wrapped;
   }
   return res;
+}
+
+async function inspectComfySubmission(promptId, options = {}) {
+  const inspect = async (endpoint) => {
+    try {
+      const response = await comfyFetch(endpoint, { signal: AbortSignal.timeout(4000) });
+      return { ok: true, value: await response.json() };
+    } catch (error) {
+      return {
+        ok: false,
+        offline: error?.code === 'comfy_connection_failed',
+        code: String(error?.code || error?.name || 'inspection_failed'),
+      };
+    }
+  };
+  const [queue, history] = await Promise.all([
+    inspect('/queue'),
+    inspect(`/history/${encodeURIComponent(promptId)}`),
+  ]);
+  return decideComfySubmission({
+    promptId,
+    localState: options.localState || 'prepared',
+    cancelTombstone: options.cancelTombstone === true,
+    queue,
+    history,
+  });
+}
+
+function comfySubmissionDecisionError(decision, cause = null) {
+  const message = decision?.state === 'attention'
+    ? 'ComfyUI reported conflicting records for this preserved generation. Mix will not submit a duplicate.'
+    : 'Mix could not yet prove whether ComfyUI accepted this preserved generation. It will reconcile before retrying.';
+  const error = new Error(message, cause ? { cause } : undefined);
+  error.code = decision?.code || 'comfy_submission_unknown';
+  error.status = decision?.state === 'attention' ? 409 : 503;
+  error.submissionDecision = decision;
+  return error;
 }
 
 async function getComfyCompatibility(force = false, basePath = '') {
@@ -2260,6 +2328,19 @@ async function queuePrompt(graph, options = {}) {
   if (options.workflowContractId) {
     assertWorkflowCapability(options.workflowContractId, graph, await getObjectInfo());
   }
+  const stablePromptId = String(options.promptId || '').trim();
+  if (options.profileId) {
+    const outputProfile = db.profiles.find((profile) => profile.id === options.profileId);
+    if (outputProfile) applyProfileOutputPrefix(graph, outputProfile);
+  }
+  if (stablePromptId) {
+    const decision = await inspectComfySubmission(stablePromptId, {
+      localState: options.localState,
+      cancelTombstone: options.cancelTombstone,
+    });
+    if (['adopt', 'finalize', 'terminal'].includes(decision.state)) return stablePromptId;
+    if (!decision.safeToSubmit) throw comfySubmissionDecisionError(decision);
+  }
   if (options.elementInputsStaged !== true
     && Array.isArray(options.elementInputNames) && options.elementInputNames.length) {
     await stageElementInputs({
@@ -2270,20 +2351,38 @@ async function queuePrompt(graph, options = {}) {
       uploadFile: uploadFileToComfy,
     });
   }
-  if (options.profileId) {
-    const outputProfile = db.profiles.find((profile) => profile.id === options.profileId);
-    if (outputProfile) applyProfileOutputPrefix(graph, outputProfile);
-  }
   const body = { prompt: graph, client_id: CLIENT_ID };
   if (options.front === true) body.front = true;
-  const res = await comfyFetch('/prompt', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(body),
-  });
-  const json = await res.json();
+  if (stablePromptId) body.prompt_id = stablePromptId;
+  let json;
+  try {
+    const res = await comfyFetch('/prompt', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+      signal: AbortSignal.timeout(30_000),
+    });
+    json = await res.json();
+  } catch (error) {
+    if (!stablePromptId || error?.code === 'comfy_http_error') throw error;
+    const decision = await inspectComfySubmission(stablePromptId, {
+      localState: 'submission_unknown',
+      cancelTombstone: options.cancelTombstone,
+    });
+    if (['adopt', 'finalize', 'terminal'].includes(decision.state)) return stablePromptId;
+    throw comfySubmissionDecisionError(decision, error);
+  }
   if (json.node_errors && Object.keys(json.node_errors).length) {
-    throw new Error('ComfyUI validation: ' + JSON.stringify(json.node_errors).slice(0, 500));
+    const error = new Error('ComfyUI validation: ' + JSON.stringify(json.node_errors).slice(0, 500));
+    error.code = 'comfy_prompt_validation_failed';
+    error.status = 400;
+    throw error;
+  }
+  if (stablePromptId && json.prompt_id !== stablePromptId) {
+    const error = new Error('The connected ComfyUI did not honor Mix Studio’s stable prompt ID. The generation was preserved but not retried.');
+    error.code = 'comfy_prompt_id_mismatch';
+    error.status = 409;
+    throw error;
   }
   return json.prompt_id;
 }
@@ -3304,6 +3403,7 @@ setInterval(async () => {
       else {
         const job = jobs.get(pid);
         if (!job || job.provider === 'runpod') continue;
+        if (['staging', 'submitting', 'reconciling'].includes(job.submissionState)) continue;
         if (!livePromptIds) {
           const queue = await (await comfyFetch('/queue')).json();
           livePromptIds = new Set([...(queue.queue_running || []), ...(queue.queue_pending || [])]
@@ -5122,19 +5222,97 @@ async function buildGenerationGraph(p, refNames) {
   return hasActiveRegions(p.regions) ? buildRegionalT2I(p) : buildT2I(p);
 }
 
+function preserveDurableSubmission(error) {
+  if (error?.submissionDecision) return true;
+  if (Number(error?.status) >= 500) return true;
+  return ['comfy_connection_failed', 'comfy_prompt_id_mismatch', 'element_asset_missing',
+    'element_asset_unavailable', 'comfy_runtime_mismatch', 'comfy_runtime_unverifiable']
+    .includes(String(error?.code || ''));
+}
+
+async function submitDurableGeneration(pid, job) {
+  try {
+    if (job.elementInputNames.length) {
+      persistJob(pid, { submissionState: 'staging' });
+      await stageQueuedElementInputs(job);
+      persistJob(pid, { submissionState: 'staged', stagedAt: Date.now() });
+    }
+    const submissionAttemptId = crypto.randomUUID();
+    persistJob(pid, {
+      submissionState: 'submitting',
+      submissionAttemptId,
+      submitStartedAt: Date.now(),
+    });
+    const queuedPid = await queuePrompt(job.graph, {
+      profileId: job.profileId,
+      elementInputNames: job.elementInputNames,
+      elementInputsStaged: true,
+      workflowContractId: job.workflowContractId,
+      promptId: pid,
+      localState: 'submitting',
+    });
+    if (queuedPid !== pid) {
+      const error = new Error('ComfyUI changed the stable ID for this generation.');
+      error.code = 'comfy_prompt_id_mismatch';
+      error.status = 409;
+      throw error;
+    }
+    persistJob(pid, {
+      submissionState: 'submitted',
+      submittedAt: Date.now(),
+      lastReconciledAt: Date.now(),
+      recoveryError: undefined,
+    });
+    ensureWs();
+    return { deferred: false };
+  } catch (error) {
+    if (!preserveDurableSubmission(error)) {
+      jobs.delete(pid);
+      throw error;
+    }
+    const needsAttention = error?.submissionDecision?.state === 'attention'
+      || ['comfy_prompt_id_mismatch', 'element_asset_missing', 'element_asset_unavailable',
+        'comfy_runtime_mismatch', 'comfy_runtime_unverifiable'].includes(String(error?.code || ''));
+    persistJob(pid, {
+      submissionState: needsAttention ? 'attention' : 'submission_unknown',
+      lastReconciledAt: Date.now(),
+      recoveryError: needsAttention ? {
+        code: String(error?.code || 'durable_submission_attention'),
+        message: String(error?.message || error),
+        attentionRequired: true,
+      } : undefined,
+    });
+    ensureWs();
+    broadcast('status', {
+      jobId: pid,
+      profileId: job.profileId,
+      kind: job.kind,
+      text: needsAttention
+        ? String(error?.message || 'This preserved generation needs attention.')
+        : 'Generation preserved. Waiting for ComfyUI to reconnect safely…',
+      itemId: job.itemId || null,
+    });
+    return { deferred: true };
+  }
+}
+
 async function queueGenerationJob(p, profileId, refNames, refinedPrompt = null) {
   const graph = await buildGenerationGraph(p, refNames);
   const workflowContractId = p.elementIdentityMode
     ? 'create.krea2.element-character@1'
     : (p.elementReferenceMode ? 'create.krea2.element-remix@1' : '');
   const elementInputNames = (p.elementsUsed || []).flatMap((element) => element.assetNames || []);
-  const pid = await queuePrompt(graph, { profileId, elementInputNames, workflowContractId });
-  trackJob(pid, {
+  const outputProfile = db.profiles.find((profile) => profile.id === profileId);
+  if (outputProfile) applyProfileOutputPrefix(graph, outputProfile);
+  const pid = crypto.randomUUID();
+  const job = {
     kind: 'gen', profileId, params: p, graph, refImageNames: refNames,
-    elementInputNames, workflowContractId, refinedPrompt,
-  });
-  ensureWs();
-  return { pid, graph };
+    elementInputNames, workflowContractId, refinedPrompt, operationId: pid, promptId: pid,
+    submissionState: 'prepared',
+  };
+  trackJob(pid, job);
+  const submitted = await submitDurableGeneration(pid, job);
+  return { pid, graph, deferred: submitted.deferred };
 }
 
 async function queueStrengthHuntJob(p, profileId, refNames, refinedPrompt = null) {
@@ -5154,13 +5332,17 @@ async function queueStrengthHuntJob(p, profileId, refNames, refinedPrompt = null
     ? 'create.krea2.element-character@1'
     : (p.elementReferenceMode ? 'create.krea2.element-remix@1' : '');
   const elementInputNames = (p.elementsUsed || []).flatMap((element) => element.assetNames || []);
-  const pid = await queuePrompt(graph, { profileId, elementInputNames, workflowContractId });
-  trackJob(pid, {
+  const outputProfile = db.profiles.find((profile) => profile.id === profileId);
+  if (outputProfile) applyProfileOutputPrefix(graph, outputProfile);
+  const pid = crypto.randomUUID();
+  const job = {
     kind: 'loraHunt', profileId, params: Object.assign({}, p, { batch: 1, postUpscale: undefined }),
     graph, refImageNames: refNames, elementInputNames, workflowContractId, refinedPrompt, huntPlan,
-  });
-  ensureWs();
-  return { pid, graph, huntPlan };
+    operationId: pid, promptId: pid, submissionState: 'prepared',
+  };
+  trackJob(pid, job);
+  const submitted = await submitDurableGeneration(pid, job);
+  return { pid, graph, huntPlan, deferred: submitted.deferred };
 }
 
 async function queueNextSequentialEdit(job, sourceItem) {
@@ -9281,6 +9463,7 @@ async function handleApi(req, res, url) {
       jobId: queued.pid,
       seed: p.seed,
       refinedPrompt: refined,
+      deferred: queued.deferred || undefined,
       sequenceId: p.editSequence ? p.editSequence.id : undefined,
       strengthHunt: huntCount || undefined,
       vramProfile,
