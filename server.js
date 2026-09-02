@@ -79,6 +79,7 @@ const { restartComfy, restartStatus, startComfy, startStatus } = require('./lib/
 const { discoverComfyEndpoints, probeComfyUrl } = require('./lib/comfy-discovery');
 const { assertVerifiedComfyRuntime, attestComfyEndpoint } = require('./lib/comfy-runtime-identity');
 const { decideComfySubmission } = require('./lib/comfy-submission-reconciler');
+const { durableCancellationDecision } = require('./lib/durable-cancellation');
 const { assertWorkflowCapability } = require('./lib/workflow-capabilities');
 const {
   normalizeGenerationDefaults,
@@ -1542,6 +1543,7 @@ function describeQueueEntry(entry, running) {
     startedAt,
     elapsedMs: now - (running ? (startedAt || queuedAt) : queuedAt),
     durationMs: now - (running ? (startedAt || queuedAt) : queuedAt),
+    cancelling: job?.cancelRequested === true,
   };
 }
 
@@ -2487,7 +2489,13 @@ function handleWsMessage(msg) {
     const job = jobs.get(pid);
     activeWsPromptId = d.node === null ? '' : pid;
     if (job && d.node !== null && !job.startedAt) job.startedAt = Date.now();
-    if (d.node === null) completeJob(pid).catch((e) => failJob(pid, e.message));
+    if (d.node === null) {
+      if (job?.cancelRequested && ['gen', 'loraHunt'].includes(job.kind)) {
+        reconcileDurableCancellation(pid, job).catch(() => { /* polling retains and retries the tombstone */ });
+      } else {
+        completeJob(pid).catch((e) => failJob(pid, e.message));
+      }
+    }
     else broadcast('status', {
       jobId: pid,
       profileId: job.profileId,
@@ -2497,6 +2505,11 @@ function handleWsMessage(msg) {
       ...progressPhaseForJob(job, d.node),
     });
   } else if (msg.type === 'execution_error' && pid && jobs.has(pid)) {
+    const job = jobs.get(pid);
+    if (job?.cancelRequested) {
+      cancelJob(pid, job.cancelMessage || 'Cancelled');
+      return;
+    }
     const rawMessage = (d.exception_message || 'execution error') + (d.node_type ? ` (${d.node_type})` : '');
     const message = process.platform === 'darwin' && /aten::_int_mm|not currently implemented for the MPS device/i.test(rawMessage)
       ? 'This INT8 model needs PyTorch CPU fallback on Apple silicon. Mix has enabled it for future launches; when the queues are idle, restart Comfy Desktop and try again. (KSampler)'
@@ -2560,6 +2573,107 @@ async function stopComfyPrompt(pid) {
   } catch { /* ComfyUI may be temporarily offline */ }
   if (running) await comfyFetch('/interrupt', { method: 'POST' }).catch(() => { /* noop */ });
   return running;
+}
+
+function durableCancellationOperation(pid, job) {
+  return {
+    id: String(job.operationId || pid),
+    state: String(job.submissionState || 'submitted'),
+    submission: { comfyPromptId: String(job.promptId || pid) },
+    cancellation: job.cancelRequested ? {
+      requestedAt: Number(job.cancelRequestedAt) || Date.now(),
+      reason: String(job.cancelMessage || 'Cancelled by user'),
+    } : null,
+  };
+}
+
+function observedCancellationState(decision) {
+  if (decision?.state === 'cancel') {
+    return decision.remoteState === 'running' ? 'running' : 'queued';
+  }
+  if (decision?.code === 'cancel_tombstone_history') return 'completed';
+  if (decision?.code === 'cancel_tombstone_confirmed_absent') return 'absent';
+  return 'offline';
+}
+
+async function reconcileDurableCancellation(pid, job) {
+  if (!job || !['gen', 'loraHunt'].includes(job.kind) || !job.cancelRequested) {
+    return { settled: false, pending: false };
+  }
+  if (job.cancellationReconciling) return { settled: false, pending: true };
+  job.cancellationReconciling = true;
+  try {
+    let remote = await inspectComfySubmission(job.promptId || pid, {
+      localState: job.submissionState,
+      cancelTombstone: true,
+    });
+    if (remote.state === 'attention') {
+      persistJob(pid, {
+        submissionState: 'attention',
+        recoveryError: {
+          code: remote.code,
+          message: 'ComfyUI reported conflicting records while Mix was cancelling this generation.',
+          attentionRequired: true,
+        },
+      });
+      return { settled: false, pending: true };
+    }
+    let plan = durableCancellationDecision(durableCancellationOperation(pid, job), observedCancellationState(remote));
+    if (plan.terminal) {
+      cancelJob(pid, job.cancelMessage || 'Cancelled by user');
+      return { settled: true, pending: false };
+    }
+    if (plan.actions.some((action) => action.type === 'wait_for_reconnect')) {
+      persistJob(pid, { submissionState: 'cancel_requested' });
+      broadcast('status', {
+        jobId: pid,
+        profileId: job.profileId,
+        kind: job.kind,
+        text: 'Cancellation saved. Waiting for ComfyUI to reconnect…',
+        itemId: job.itemId || null,
+      });
+      return { settled: false, pending: true };
+    }
+    persistJob(pid, { submissionState: 'cancelling' });
+    for (const action of plan.actions) {
+      try {
+        if (action.type === 'delete_queued_prompt') {
+          await comfyFetch('/queue', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ delete: [action.promptId] }),
+          });
+        } else if (action.type === 'interrupt_running_prompt') {
+          await comfyFetch('/interrupt', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ prompt_id: action.promptId }),
+          });
+        }
+      } catch { /* Reconciliation below distinguishes applied from unavailable. */ }
+    }
+    remote = await inspectComfySubmission(job.promptId || pid, {
+      localState: 'cancelling',
+      cancelTombstone: true,
+    });
+    plan = durableCancellationDecision(durableCancellationOperation(pid, job), observedCancellationState(remote));
+    if (plan.terminal) {
+      cancelJob(pid, job.cancelMessage || 'Cancelled by user');
+      return { settled: true, pending: false };
+    }
+    persistJob(pid, { submissionState: 'cancel_requested' });
+    broadcast('status', {
+      jobId: pid,
+      profileId: job.profileId,
+      kind: job.kind,
+      text: 'Cancellation saved. Waiting for ComfyUI to reconnect…',
+      itemId: job.itemId || null,
+    });
+    return { settled: false, pending: true };
+  } finally {
+    const current = jobs.get(pid);
+    if (current) current.cancellationReconciling = false;
+  }
 }
 
 function cancelJob(pid, message = 'Cancelled') {
@@ -3397,6 +3511,11 @@ setInterval(async () => {
   let livePromptIds = null;
   for (const pid of [...jobs.keys()]) {
     try {
+      const durableJob = jobs.get(pid);
+      if (durableJob?.cancelRequested && ['gen', 'loraHunt'].includes(durableJob.kind)) {
+        await reconcileDurableCancellation(pid, durableJob);
+        continue;
+      }
       const hist = (await (await comfyFetch(`/history/${pid}`)).json())[pid];
       if (hist && hist.status && hist.status.completed) await completeJob(pid);
       else if (hist && hist.status && hist.status.status_str === 'error') failJob(pid, 'Execution error (see ComfyUI console)');
@@ -11652,7 +11771,21 @@ async function handleApi(req, res, url) {
     }
     if (job.completing) return json(res, 409, { error: 'This job is already finishing' });
     job.cancelRequested = true;
-    job.cancelMessage = 'Cancelled by user';
+    persistJob(pid, {
+      cancelRequested: true,
+      cancelRequestedAt: Date.now(),
+      cancelMessage: 'Cancelled by user',
+      submissionState: ['gen', 'loraHunt'].includes(job.kind) ? 'cancel_requested' : job.submissionState,
+    });
+    if (['gen', 'loraHunt'].includes(job.kind)) {
+      const cancellation = await reconcileDurableCancellation(pid, job);
+      return json(res, 200, {
+        ok: true,
+        running: false,
+        pending: cancellation.pending,
+        cancelled: cancellation.settled,
+      });
+    }
     // If it is already running, ComfyUI may emit execution_interrupted before
     // this request returns. The cancel marker keeps that event neutral.
     const stillRunning = await stopComfyPrompt(pid);

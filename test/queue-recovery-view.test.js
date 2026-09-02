@@ -68,3 +68,19 @@ test('offline queue retains ordinary durable jobs, cloud work, and stable order 
   assert.deepEqual(empty.pending, []);
   assert.deepEqual(empty.downloads, []);
 });
+
+test('offline queue keeps durable cancellation visible until Comfy confirms it', () => {
+  const rows = preservedQueueRows(new Map([
+    ['cancel-me', {
+      kind: 'gen', profileId: 'owner', enqueuedAt: 10,
+      cancelRequested: true, submissionState: 'cancel_requested',
+    }],
+  ]), {
+    profileId: 'owner', now: 20,
+    thumbnailFor: () => null, labelFor: () => 'Cancelled portrait', durationFor: () => 10,
+  });
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].cancelling, true);
+  assert.equal(rows[0].waitingForComfy, false);
+  assert.equal(rows[0].cancellable, true);
+});

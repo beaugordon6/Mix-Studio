@@ -22533,9 +22533,9 @@ function renderQueue(q) {
     st.dataset.jobId = j.jobId;
     const pct = state.queueProgress[j.jobId];
     const elapsed = j.elapsedMs != null ? formatDuration(j.elapsedMs) : '';
-    st.textContent = j.attentionRequired ? 'Attention' : (j.waitingForComfy ? 'Waiting for ComfyUI' : (j.preparing ? 'Enhancing' : (j.finalizing ? 'Finalizing'
+    st.textContent = j.attentionRequired ? 'Attention' : (j.cancelling ? 'Cancelling' : (j.waitingForComfy ? 'Waiting for ComfyUI' : (j.preparing ? 'Enhancing' : (j.finalizing ? 'Finalizing'
       : (j.upcoming ? (j.waitingForReview ? 'Review' : 'Upcoming')
-        : (j.run ? (pct != null ? pct + '%' : 'Running') : 'Queued')))));
+        : (j.run ? (pct != null ? pct + '%' : 'Running') : 'Queued'))))));
     const lb = document.createElement('span');
     lb.className = 'q-label';
     const queueLabel = j.attentionRequired && j.error ? `${j.label} — ${j.error}` : j.label;
@@ -22556,7 +22556,7 @@ function renderQueue(q) {
     x.type = 'button';
     x.setAttribute('aria-label', j.waitingForReview ? 'Remove Smart review items'
       : (j.attentionRequired ? 'Remove job needing attention' : (j.run ? 'Stop job' : 'Remove queued job')));
-    x.hidden = !!j.preparing || !!j.finalizing || j.cancellable === false || j.owned !== true;
+    x.hidden = !!j.preparing || !!j.finalizing || !!j.cancelling || j.cancellable === false || j.owned !== true;
     x.addEventListener('click', async (e) => {
       e.stopPropagation();
       if (!await askConfirm({
@@ -22569,12 +22569,13 @@ function renderQueue(q) {
         danger: true,
       })) return;
       try {
-        await api(j.waitingForReview ? '/api/queue/reviews/clear' : '/api/queue/cancel', {
+        const result = await api(j.waitingForReview ? '/api/queue/reviews/clear' : '/api/queue/cancel', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify(j.waitingForReview ? { smartRunId: j.smartRunId } : { jobId: j.jobId }),
         });
-        toast(j.waitingForReview ? 'Smart review items removed' : (j.run ? 'Job stopped' : 'Removed from queue'));
+        toast(j.waitingForReview ? 'Smart review items removed'
+          : (result.pending ? 'Cancellation saved — waiting for ComfyUI' : (j.run ? 'Job stopped' : 'Removed from queue')));
         refreshQueue();
       } catch (e2) { toast(e2.message, true); }
     });
