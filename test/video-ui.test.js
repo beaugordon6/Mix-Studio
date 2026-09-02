@@ -762,7 +762,7 @@ test('MiniMax H3 Reference mode uses progressive media slots and prompt mention 
   assert.match(app, /function replacePromptH3ReferenceToken\(token, tag\)[\s\S]{0,360}token\.replaceWith\(replacement\)/);
   assert.match(app, /openPromptMentionPicker\(\{ targetToken: h3Token \}\)/);
   assert.match(app, /<(?:\(\?:)?Picture\|Video\|Audio\) \\\\d\+>/);
-  assert.match(app, /state\.view === 'edit' \|\| h3ReferenceModeActive\(\)[\s\S]{0,100}event\.data === '@'/);
+  assert.match(app, /state\.view !== 'video' \|\| h3ReferenceModeActive\(\)[\s\S]{0,100}event\.data === '@'/);
   assert.match(app, /function renderPromptMentionPicker\(\)[\s\S]{0,760}h3PromptReferenceEntries\(\)/);
   assert.match(app, /media = document\.createElement\('video'\);[\s\S]{0,180}media\.className = 'prompt-mention-video'/);
   assert.match(app, /entry\.role === 'embedded-audio' \? 'Audio from video'/);
