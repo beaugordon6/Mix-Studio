@@ -22526,19 +22526,21 @@ function renderQueue(q) {
   }
   for (const j of rows) {
     const row = document.createElement('div');
-    row.className = 'queue-row';
+    row.className = `queue-row${j.attentionRequired ? ' attention' : ''}`;
     row.dataset.jobId = j.jobId;
     const st = document.createElement('span');
-    st.className = 'q-state' + (j.run ? ' run' : '');
+    st.className = 'q-state' + (j.run ? ' run' : '') + (j.attentionRequired ? ' attention' : '');
     st.dataset.jobId = j.jobId;
     const pct = state.queueProgress[j.jobId];
     const elapsed = j.elapsedMs != null ? formatDuration(j.elapsedMs) : '';
-    st.textContent = j.preparing ? 'Enhancing' : (j.finalizing ? 'Finalizing'
+    st.textContent = j.attentionRequired ? 'Attention' : (j.preparing ? 'Enhancing' : (j.finalizing ? 'Finalizing'
       : (j.upcoming ? (j.waitingForReview ? 'Review' : 'Upcoming')
-        : (j.run ? (pct != null ? pct + '%' : 'Running') : 'Queued')));
+        : (j.run ? (pct != null ? pct + '%' : 'Running') : 'Queued'))));
     const lb = document.createElement('span');
     lb.className = 'q-label';
-    lb.textContent = elapsed ? `${j.label} - ${elapsed}` : j.label;
+    const queueLabel = j.attentionRequired && j.error ? `${j.label} — ${j.error}` : j.label;
+    lb.textContent = elapsed ? `${queueLabel} - ${elapsed}` : queueLabel;
+    if (j.attentionRequired && j.error) row.title = j.error;
     if (j.itemId) {
       row.classList.add('q-click');
       row.title = 'Open in Library';
@@ -22552,12 +22554,14 @@ function renderQueue(q) {
     x.className = 'q-cancel';
     x.textContent = '✕';
     x.type = 'button';
-    x.setAttribute('aria-label', j.waitingForReview ? 'Remove Smart review items' : (j.run ? 'Stop job' : 'Remove queued job'));
+    x.setAttribute('aria-label', j.waitingForReview ? 'Remove Smart review items'
+      : (j.attentionRequired ? 'Remove job needing attention' : (j.run ? 'Stop job' : 'Remove queued job')));
     x.hidden = !!j.preparing || !!j.finalizing || j.cancellable === false || j.owned !== true;
     x.addEventListener('click', async (e) => {
       e.stopPropagation();
       if (!await askConfirm({
-        title: j.waitingForReview ? 'Remove this Smart production?' : (j.run ? 'Stop this job?' : 'Remove queued job?'),
+        title: j.waitingForReview ? 'Remove this Smart production?'
+          : (j.attentionRequired ? 'Remove this blocked job?' : (j.run ? 'Stop this job?' : 'Remove queued job?')),
         message: j.waitingForReview
           ? 'All clips from this production that are waiting for review will be removed. Completed gallery media will not be deleted.'
           : (j.run ? 'The current generation will be interrupted.' : 'This generation will not run.'),

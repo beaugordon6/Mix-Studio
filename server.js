@@ -98,6 +98,7 @@ const {
   parseCookies,
 } = require('./lib/private-gallery');
 const { comfyResetRequests } = require('./lib/comfy-reset');
+const { stageElementInputs } = require('./lib/comfy-input-stager');
 const {
   assessQueueHealth,
   parseNvidiaSmiCsv,
@@ -1423,6 +1424,7 @@ function jobDurationMs(job, now = Date.now()) {
 
 async function requeueMissingDurableJob(pid, job) {
   if (!job || job.requeueing || !['gen', 'loraHunt'].includes(job.kind) || !job.graph) return false;
+  if (job.recoveryError?.attentionRequired) return false;
   job.requeueing = true;
   job.recoveryAttempts = Math.max(0, Number(job.recoveryAttempts) || 0) + 1;
   broadcast('status', {
@@ -1433,7 +1435,10 @@ async function requeueMissingDurableJob(pid, job) {
     itemId: job.itemId || null,
   });
   try {
-    const nextPid = await queuePrompt(job.graph, { profileId: job.profileId });
+    const nextPid = await queuePrompt(job.graph, {
+      profileId: job.profileId,
+      elementInputNames: job.elementInputNames,
+    });
     jobs.delete(pid);
     const replacement = Object.assign(job, {
       enqueuedAt: Date.now(),
@@ -1442,6 +1447,7 @@ async function requeueMissingDurableJob(pid, job) {
       requeueing: false,
     });
     delete replacement.missingFromComfyAt;
+    delete replacement.recoveryError;
     trackJob(nextPid, replacement);
     updateSmartChunkJob(replacement, nextPid, 0, 1);
     ensureWs();
@@ -1450,12 +1456,20 @@ async function requeueMissingDurableJob(pid, job) {
   } catch (error) {
     job.requeueing = false;
     job.missingFromComfyAt = Date.now();
+    const elementNeedsAttention = ['element_asset_missing', 'element_asset_unavailable'].includes(error?.code);
+    job.recoveryError = elementNeedsAttention ? {
+      code: error.code,
+      message: String(error.message || error),
+      attentionRequired: true,
+    } : undefined;
     localJobJournal.put(pid, job);
     broadcast('status', {
       jobId: pid,
       profileId: job.profileId,
       kind: job.kind,
-      text: 'Waiting for ComfyUI to accept the preserved generation…',
+      text: elementNeedsAttention
+        ? String(error.message || 'This preserved generation needs its Element image replaced.')
+        : 'Waiting for ComfyUI to accept the preserved generation…',
       itemId: job.itemId || null,
     });
     return false;
@@ -2213,6 +2227,16 @@ async function uploadFileToComfy(file, filename) {
 }
 
 async function queuePrompt(graph, options = {}) {
+  if (options.elementInputsStaged !== true
+    && Array.isArray(options.elementInputNames) && options.elementInputNames.length) {
+    await stageElementInputs({
+      names: options.elementInputNames,
+      profileId: options.profileId,
+      uploadedAssets: db.uploadedAssets,
+      inputDirectory: INPUTS,
+      uploadFile: uploadFileToComfy,
+    });
+  }
   if (options.profileId) {
     const outputProfile = db.profiles.find((profile) => profile.id === options.profileId);
     if (outputProfile) applyProfileOutputPrefix(graph, outputProfile);
@@ -2229,6 +2253,17 @@ async function queuePrompt(graph, options = {}) {
     throw new Error('ComfyUI validation: ' + JSON.stringify(json.node_errors).slice(0, 500));
   }
   return json.prompt_id;
+}
+
+async function stageQueuedElementInputs(job) {
+  if (!Array.isArray(job?.elementInputNames) || !job.elementInputNames.length) return [];
+  return stageElementInputs({
+    names: job.elementInputNames,
+    profileId: job.profileId,
+    uploadedAssets: db.uploadedAssets,
+    inputDirectory: INPUTS,
+    uploadFile: uploadFileToComfy,
+  });
 }
 
 /* --------------------------- WebSocket ---------------------------- */
@@ -5056,8 +5091,11 @@ async function buildGenerationGraph(p, refNames) {
 
 async function queueGenerationJob(p, profileId, refNames, refinedPrompt = null) {
   const graph = await buildGenerationGraph(p, refNames);
-  const pid = await queuePrompt(graph, { profileId });
-  trackJob(pid, { kind: 'gen', profileId, params: p, graph, refImageNames: refNames, refinedPrompt });
+  const elementInputNames = (p.elementsUsed || []).flatMap((element) => element.assetNames || []);
+  const pid = await queuePrompt(graph, { profileId, elementInputNames });
+  trackJob(pid, {
+    kind: 'gen', profileId, params: p, graph, refImageNames: refNames, elementInputNames, refinedPrompt,
+  });
   ensureWs();
   return { pid, graph };
 }
@@ -5075,10 +5113,11 @@ async function queueStrengthHuntJob(p, profileId, refNames, refinedPrompt = null
     }), refNames));
   }
   const graph = mergeStrengthHuntGraphs(graphs);
-  const pid = await queuePrompt(graph, { profileId });
+  const elementInputNames = (p.elementsUsed || []).flatMap((element) => element.assetNames || []);
+  const pid = await queuePrompt(graph, { profileId, elementInputNames });
   trackJob(pid, {
     kind: 'loraHunt', profileId, params: Object.assign({}, p, { batch: 1, postUpscale: undefined }),
-    graph, refImageNames: refNames, refinedPrompt, huntPlan,
+    graph, refImageNames: refNames, elementInputNames, refinedPrompt, huntPlan,
   });
   ensureWs();
   return { pid, graph, huntPlan };
@@ -11205,7 +11244,16 @@ async function handleApi(req, res, url) {
         preparing: true,
         cancellable: false,
       })));
-      const upcoming = db.smartRuns
+      const attentionRows = [...jobs.entries()]
+        .filter(([, job]) => job.profileId === req.profile.id && job.recoveryError?.attentionRequired)
+        .map(([jobId, job]) => ({
+          jobId, kind: job.kind, itemId: job.itemId || null, thumbnail: jobThumbnail(job),
+          label: jobLabel(job), queuedAt: job.enqueuedAt || queueNow, startedAt: null,
+          elapsedMs: jobDurationMs(job, queueNow), durationMs: jobDurationMs(job, queueNow),
+          owned: true, cancellable: true, reorderable: false, attentionRequired: true,
+          error: job.recoveryError.message, code: job.recoveryError.code,
+        }));
+      const upcoming = attentionRows.concat(db.smartRuns
         .filter((run) => run.profileId === req.profile.id && ['ready', 'running', 'queueing', 'review'].includes(run.status))
         .flatMap((run) => (run.steps || []).filter((step) => step.status === 'pending').map((step) => ({
           jobId: `smart-${run.id}-${step.id}`,
@@ -11220,7 +11268,7 @@ async function handleApi(req, res, url) {
           cancellable: run.status === 'review',
           reorderable: false,
           owned: true,
-        })));
+        }))));
       const queuedIds = new Set([...running, ...pending].map((row) => row.jobId));
       const now = Date.now();
       const finalizing = [...jobs.entries()]
@@ -11315,6 +11363,16 @@ async function handleApi(req, res, url) {
         return json(res, 409, { error: 'Only Mix Studio jobs from this profile can be reordered' });
       }
     }
+    try {
+      // Staging is fallible. Complete it before deleting anything from ComfyUI
+      // so an unavailable Element can never turn reorder into queue loss.
+      for (const pid of order) await stageQueuedElementInputs(jobs.get(pid));
+    } catch (error) {
+      return json(res, Number(error?.status) || 502, {
+        error: String(error.message || error),
+        code: error?.code || 'comfy_input_stage_failed',
+      });
+    }
     await comfyFetch('/queue', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -11324,7 +11382,11 @@ async function handleApi(req, res, url) {
     try {
       for (const oldPid of order) {
         const job = jobs.get(oldPid);
-        const newPid = await queuePrompt(job.graph, { profileId: job.profileId });
+        const newPid = await queuePrompt(job.graph, {
+          profileId: job.profileId,
+          elementInputNames: job.elementInputNames,
+          elementInputsStaged: true,
+        });
         jobs.delete(oldPid);
         jobs.set(newPid, Object.assign(job, {
           enqueuedAt: Date.now(),
@@ -12408,12 +12470,16 @@ const server = http.createServer(async (req, res) => {
   } catch (e) {
     const cancelled = e && e.code === 'job_cancelled';
     const setupRequired = e && e.code === 'comfy_krea2_update_required';
+    const explicitStatus = Number(e && e.status);
+    const responseStatus = cancelled || setupRequired
+      ? 409
+      : (Number.isInteger(explicitStatus) && explicitStatus >= 400 && explicitStatus <= 599 ? explicitStatus : 500);
     const loggedPath = url.pathname.startsWith('/mcp/') ? '/mcp/[redacted]' : url.pathname;
     if (!cancelled) console.error('[error]', req.method, loggedPath, e.message);
     if (!res.headersSent) {
-      json(res, cancelled || setupRequired ? 409 : 500, {
+      json(res, responseStatus, {
         error: String(e.message || e),
-        code: cancelled ? 'job_cancelled' : (setupRequired ? e.code : undefined),
+        code: cancelled ? 'job_cancelled' : (e && e.code ? e.code : undefined),
       });
     }
   }

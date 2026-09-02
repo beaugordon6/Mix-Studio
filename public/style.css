@@ -633,6 +633,8 @@ html:-webkit-full-screen { background: #000; }
   color: var(--muted-2); font-weight: 900;
 }
 .q-state.run { color: var(--spectrum-green); }
+.q-state.attention { color: #ffaaa3; }
+.queue-row.attention .q-label { color: #ffd1cd; white-space: normal; }
 .q-state.cancelled { color: var(--muted); letter-spacing: .045em; }
 .queue-row.cancelled .q-thumb { filter: saturate(.3); opacity: .68; }
 .queue-row.cancelled .q-label { color: var(--muted); }

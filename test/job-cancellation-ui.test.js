@@ -79,5 +79,6 @@ test('queue controls and preprocessing cancellation stay profile-safe and neutra
   assert.match(app, /error\.code = data\.code \|\| ''/);
   assert.match(app, /function isJobCancellation\(error\)/);
   assert.match(server, /error\.code = 'job_cancelled'/);
-  assert.match(server, /cancelled \|\| setupRequired \? 409 : 500/);
+  assert.match(server, /const responseStatus = cancelled \|\| setupRequired[\s\S]*?Number\.isInteger\(explicitStatus\)/);
+  assert.match(server, /code: cancelled \? 'job_cancelled' : \(e && e\.code \? e\.code : undefined\)/);
 });

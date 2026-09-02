@@ -220,8 +220,8 @@ test('Smart restores its latest saved plan and automatically resumes safe work a
   assert.match(server, /scheduleSmartRunRecovery\(250\)/);
 });
 
-test('queue includes every pending Smart production step as an upcoming job', () => {
-  assert.match(server, /const upcoming = db\.smartRuns/);
+test('queue includes attention jobs and every pending Smart production step as upcoming jobs', () => {
+  assert.match(server, /const upcoming = attentionRows\.concat\(db\.smartRuns/);
   assert.match(server, /step\.status === 'pending'/);
   assert.match(server, /jobId: `smart-\$\{run\.id\}-\$\{step\.id\}`/);
   assert.match(server, /waitingForReview: run\.status === 'review'/);
