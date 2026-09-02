@@ -47,13 +47,6 @@ for source in \
   fi
 done
 
-# Install only declared dependencies of the volume-backed H3 nodes. The base
-# image already pins torch/CUDA, so its constraints file is retained.
-for requirements in "$COMFY_DIR"/custom_nodes/*/requirements.txt; do
-  [[ -f "$requirements" ]] || continue
-  python -m pip install --no-cache-dir -r "$requirements"
-done
-
 cd "$COMFY_DIR"
 python main.py --listen 127.0.0.1 --port 8188 --disable-auto-launch --extra-model-paths-config extra_model_paths.yaml &
 COMFY_PID=$!
