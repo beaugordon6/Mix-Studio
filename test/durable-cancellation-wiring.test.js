@@ -15,11 +15,11 @@ test('durable image cancellation is persisted before any Comfy request', () => {
   );
   assert.ok(route.indexOf('persistJob(pid, {') < route.indexOf('reconcileDurableCancellation(pid, job)'));
   assert.match(route, /cancelRequested: true[\s\S]*?cancelRequestedAt: Date\.now\(\)[\s\S]*?submissionState:[\s\S]*?'cancel_requested'/);
-  assert.match(route, /if \(\['gen', 'loraHunt'\]\.includes\(job\.kind\)\)[\s\S]*?pending: cancellation\.pending/);
+  assert.match(route, /if \(isDurableComfyJob\(job\)\)[\s\S]*?pending: cancellation\.pending/);
 });
 
 test('reconciliation suppresses completion while a durable cancellation tombstone exists', () => {
-  assert.match(server, /if \(durableJob\?\.cancelRequested && \['gen', 'loraHunt'\]\.includes\(durableJob\.kind\)\) \{[\s\S]*?reconcileDurableCancellation\(pid, durableJob\);[\s\S]*?continue;/);
+  assert.match(server, /if \(durableJob\?\.cancelRequested && isDurableComfyJob\(durableJob\)\) \{[\s\S]*?reconcileDurableCancellation\(pid, durableJob\);[\s\S]*?continue;/);
   assert.match(server, /interrupt_running_prompt[\s\S]*?body: JSON\.stringify\(\{ prompt_id: action\.promptId \}\)/);
   assert.match(server, /delete_queued_prompt[\s\S]*?body: JSON\.stringify\(\{ delete: \[action\.promptId\] \}\)/);
 });

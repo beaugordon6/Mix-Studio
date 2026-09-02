@@ -27,7 +27,7 @@ test('upscale jobs and their parent-child checkpoints survive restart', () => {
 });
 
 test('standalone upscale records the durable job before any external side effect', () => {
-  const route = between(server, "if (route === '/api/upscale'", "if (route === '/api/face-fix'");
+  const route = between(server, "if (route === '/api/upscale'", "if (route === '/api/director/assets'");
   const queue = between(server, 'async function queueDurableUpscale(', 'function ultimateSdUpscaleReadinessError(');
   assert.match(route, /queueDurableUpscale\(item, opts, req\.profile\.id\)/);
   assert.doesNotMatch(route, /queuePrompt\(/);

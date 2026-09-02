@@ -52,8 +52,9 @@ test('ComfyUI multipart bodies stream the stored file with an exact length', asy
 test('uploaded inputs are stored locally, streamed to ComfyUI, and served with range support', () => {
   assert.match(serverSource, /const INPUTS = path\.join\(DATA, 'inputs'\)/);
   assert.match(serverSource, /await receiveInputFile\(req, temporary, MAX_INPUT_BYTES\)/);
-  assert.match(serverSource, /uploadFileToComfy\(temporary, name\)/);
-  assert.match(serverSource, /const durable = inputAssetPath\(INPUTS, comfyName\)/);
+  assert.match(serverSource, /durableInputStager\.preserveFile\(\{[\s\S]*?filePath: temporary/);
+  assert.match(serverSource, /const durableAlias = inputAssetPath\(INPUTS, name\)/);
+  assert.match(serverSource, /durableInputStager\.stageFile\(\{[\s\S]*?assetId: preserved\.asset\.assetId/);
   assert.match(serverSource, /return serveFile\(res, local, req\.headers\.range\)/);
   assert.match(serverSource, /older inputs fall back to ComfyUI/);
   assert.match(serverSource, /for \(let attempt = 0; attempt < 2; attempt \+= 1\) \{\s*const upload = await multipartFileUpload\(file, filename\)/);

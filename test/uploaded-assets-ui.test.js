@@ -31,6 +31,26 @@ test('Library has a virtual Uploaded assets collection with deletion controls', 
 test('cataloged upload and safe deletion APIs are wired server-side', () => {
   assert.match(server, /req\.headers\['x-asset-catalog'\] === '1'/);
   assert.match(server, /uploadedAssetUsage\(asset, \{ items: db\.items, jobs: \[\.\.\.jobs\.values\(\)\], elements: db\.elements \}\)/);
-  assert.match(server, /path\.join\(TRASH_ROOT, 'uploaded-assets', asset\.profileId\)/);
-  assert.match(server, /asset\.deletedAt = Date\.now\(\)/);
+  assert.match(server, /createDurableInputDeletionJournal\(\{[\s\S]*aliasDirectory: INPUTS[\s\S]*trashDirectory: TRASH_ROOT/);
+  assert.match(server, /durableInputDeletionJournal\.checkpointCatalog\([\s\S]*catalogAsset\.deletedAt = Date\.now\(\)[\s\S]*flushDbNow\(\)/);
+  assert.match(server, /await deleteUploadedAssetDurably\(asset\)/);
+});
+
+test('input previews resolve ownership by profile instead of the first matching name', () => {
+  const route = server.slice(
+    server.indexOf("if (route === '/api/input' && req.method === 'GET')"),
+    server.indexOf("if (route === '/api/upload' && req.method === 'POST')"),
+  );
+  assert.match(route, /catalogedAssets\.find\(\(asset\) => asset\.profileId === req\.profile\.id\)/);
+  assert.match(route, /catalogedAssets\.length && !catalogedAsset/);
+});
+
+test('profile deletion refuses to orphan active durable work or a reorder receipt', () => {
+  const route = server.slice(
+    server.indexOf("if (profMan && req.method === 'DELETE')"),
+    server.indexOf('// Everything else needs a signed-in profile'),
+  );
+  assert.match(route, /\[\.\.\.jobs\.values\(\)\]\.some\(\(job\) => job\?\.profileId === target\.id\)/);
+  assert.match(route, /queueReorderReceipt\?\.profileId === target\.id/);
+  assert.ok(route.indexOf('profile_has_durable_work') < route.indexOf("backupDb('pre-delete')"));
 });

@@ -27,6 +27,7 @@ test('stable submission lifecycle survives restart before Comfy acknowledgement'
   const job = {
     kind: 'gen', profileId: 'owner', params: { prompt: 'test' }, graph: { save: {} },
     operationId, promptId: operationId, submissionState: 'submitting',
+    inputAssets: [{ name: 'reference.png', assetId: 'a'.repeat(64), sha256: 'b'.repeat(64), bytes: 321 }],
     submissionAttemptId: '0f6df3a6-b7e0-448d-b2fb-186d05515bd4', submitStartedAt: 123,
     cancelRequested: true, cancelRequestedAt: 124, cancelMessage: 'Cancelled by user',
   };
@@ -36,6 +37,7 @@ test('stable submission lifecycle survives restart before Comfy acknowledgement'
   assert.equal(restored.promptId, operationId);
   assert.equal(restored.submissionState, 'submitting');
   assert.equal(restored.submissionAttemptId, job.submissionAttemptId);
+  assert.deepEqual(restored.inputAssets, job.inputAssets);
   assert.equal(restored.cancelRequested, true);
   assert.equal(restored.cancelRequestedAt, 124);
 });

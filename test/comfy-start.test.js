@@ -3,6 +3,7 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
+const { EventEmitter } = require('node:events');
 const os = require('node:os');
 const path = require('node:path');
 
@@ -92,10 +93,39 @@ test('macOS starts a source ComfyUI with Metal-safe launch settings', async () =
       path.join(base, 'main.py'), '--listen', '127.0.0.1', '--port', '8188',
       '--fp32-vae', '--use-split-cross-attention',
     ]);
-    assert.deepEqual(status.launchEnv, { PYTORCH_ENABLE_MPS_FALLBACK: '1' });
+    assert.deepEqual(status.launchEnv, {
+      PYTORCH_ENABLE_MPS_FALLBACK: '1',
+      ASFP8_ENABLE_ONLY: 'fp8_mps_strided,comfykitchen_fp8,scaled_mm_fp8,ops_bias_fp8,stochastic_round_fp8,tensor_to_fp8,linear_fp8,fp8_linear_kernel_mps,fused_norm_mps,rope_fast_mps,int_mm_mps,int8_linear_kernel_mps',
+      APPLESILICON_FP8_MPS_WATERMARK: 'off',
+    });
     let launched = null;
     await startComfy(runtime, () => {}, Object.assign({}, options, { spawn(value) { launched = value; } }));
     assert.equal(launched.pythonPath, python);
+  } finally {
+    fs.rmSync(temp, { recursive: true, force: true });
+  }
+});
+
+test('source Comfy startup returns a PID and observable early-exit signal', async () => {
+  const temp = fs.mkdtempSync(path.join(os.tmpdir(), 'mix-comfy-source-observable-'));
+  const base = path.join(temp, 'ComfyUI');
+  const python = path.join(base, '.venv', 'bin', 'python');
+  fs.mkdirSync(path.dirname(python), { recursive: true });
+  fs.mkdirSync(path.join(base, 'models'), { recursive: true });
+  fs.writeFileSync(path.join(base, 'main.py'), '');
+  fs.writeFileSync(python, '');
+  try {
+    const child = new EventEmitter();
+    child.pid = 4242;
+    child.unref = () => {};
+    const started = await startComfy({ comfy: { path: base, url: 'http://127.0.0.1:8188' } }, () => {}, {
+      platform: 'darwin', env: {}, home: path.join(temp, 'missing'), fsImpl: fs,
+      spawnProcess: () => child,
+    });
+    assert.equal(started.pid, 4242);
+    assert.equal(typeof started.exited?.then, 'function');
+    child.emit('exit', 139, 'SIGSEGV');
+    assert.deepEqual(await started.exited, { code: 139, signal: 'SIGSEGV' });
   } finally {
     fs.rmSync(temp, { recursive: true, force: true });
   }
@@ -105,7 +135,7 @@ test('macOS launcher primes the GUI environment used by Comfy Desktop', () => {
   const launcher = fs.readFileSync(path.join(__dirname, '..', 'start.command'), 'utf8');
   assert.match(launcher, /export PYTORCH_ENABLE_MPS_FALLBACK="\$\{PYTORCH_ENABLE_MPS_FALLBACK:-1\}"/);
   assert.match(launcher, /\/bin\/launchctl setenv PYTORCH_ENABLE_MPS_FALLBACK "\$PYTORCH_ENABLE_MPS_FALLBACK"/);
-  assert.match(launcher, /export ASFP8_ENABLE_ONLY="\$\{ASFP8_ENABLE_ONLY:-int8_linear_kernel_mps,fused_norm_mps,rope_fast_mps\}"/);
+  assert.match(launcher, /export ASFP8_ENABLE_ONLY="\$\{ASFP8_ENABLE_ONLY:-fp8_mps_strided,comfykitchen_fp8,scaled_mm_fp8,ops_bias_fp8,stochastic_round_fp8,tensor_to_fp8,linear_fp8,fp8_linear_kernel_mps,fused_norm_mps,rope_fast_mps,int_mm_mps,int8_linear_kernel_mps\}"/);
   assert.match(launcher, /\/bin\/launchctl setenv ASFP8_ENABLE_ONLY "\$ASFP8_ENABLE_ONLY"/);
   assert.match(launcher, /export APPLESILICON_FP8_MPS_WATERMARK="\$\{APPLESILICON_FP8_MPS_WATERMARK:-off\}"/);
 });
@@ -116,11 +146,17 @@ test('MPS int-mm failures are translated into an actionable idle restart message
   assert.match(server, /when the queues are idle, restart Comfy Desktop and try again/);
 });
 
-test('the Start API is owner-only, operation-safe, and separate from task-killing restart', () => {
+test('the Start API is owner-only, permits preserved-job recovery, and is separate from task-killing restart', () => {
   const server = fs.readFileSync(path.join(__dirname, '..', 'server.js'), 'utf8');
   const startRoute = server.slice(server.indexOf("route === '/api/comfy/start'"), server.indexOf("route === '/api/comfy/restart'"));
   assert.match(startRoute, /Only the owner profile can start ComfyUI/);
-  assert.match(startRoute, /assertDesktopIsIdle\(\)/);
+  assert.doesNotMatch(startRoute, /assertDesktopIsIdle\(\)/);
+  assert.match(startRoute, /Preserved jobs must never prevent their own engine restart/);
+  assert.match(startRoute, /getComfyAvailabilitySupervisor\(\)\.isRunning\(\)/);
+  assert.ok(
+    startRoute.indexOf('comfyStartRunning = true') < startRoute.indexOf('await discoverLocalComfy'),
+    'manual Start must claim the shared launch lane before its first asynchronous discovery',
+  );
   assert.match(startRoute, /startComfy\(RUNTIME/);
   assert.match(startRoute, /waitForStartedComfy/);
   assert.doesNotMatch(startRoute, /taskkill|pidsListeningOn|restartComfy/);
@@ -265,7 +301,11 @@ test('macOS restart sends TERM only to the verified source ComfyUI listener', as
     });
     assert.deepEqual(calls.find(([command]) => command === '/bin/kill'), ['/bin/kill', ['-TERM', '77']]);
     assert.equal(calls.some(([command]) => command === 'taskkill'), false);
-    assert.deepEqual(launched.launchEnv, { PYTORCH_ENABLE_MPS_FALLBACK: '1' });
+    assert.deepEqual(launched.launchEnv, {
+      PYTORCH_ENABLE_MPS_FALLBACK: '1',
+      ASFP8_ENABLE_ONLY: 'fp8_mps_strided,comfykitchen_fp8,scaled_mm_fp8,ops_bias_fp8,stochastic_round_fp8,tensor_to_fp8,linear_fp8,fp8_linear_kernel_mps,fused_norm_mps,rope_fast_mps,int_mm_mps,int8_linear_kernel_mps',
+      APPLESILICON_FP8_MPS_WATERMARK: 'off',
+    });
   } finally {
     fs.rmSync(temp, { recursive: true, force: true });
   }

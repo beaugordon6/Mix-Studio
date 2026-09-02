@@ -13,21 +13,21 @@ const app = fs.readFileSync(path.join(__dirname, '..', 'public', 'app.js'), 'utf
 const style = fs.readFileSync(path.join(__dirname, '..', 'public', 'style.css'), 'utf8');
 
 test('generation submission stages Element inputs before posting a prompt', () => {
-  assert.match(server, /async function queuePrompt\(graph, options = \{\}\) \{[\s\S]*?await stageElementInputs\(\{[\s\S]*?uploadFile: uploadFileToComfy,[\s\S]*?comfyFetch\('\/prompt'/);
+  assert.match(server, /async function submitDurableGeneration\(pid, job\) \{[\s\S]*?await stageQueuedInputs\(job\)[\s\S]*?queuePrompt\(job\.graph/);
   assert.match(server, /queueGenerationJob[\s\S]*?const pid = crypto\.randomUUID\(\)[\s\S]*?trackJob\(pid, job\)[\s\S]*?submitDurableGeneration\(pid, job\)/);
-  assert.match(server, /submitDurableGeneration[\s\S]*?submissionState: 'staging'[\s\S]*?stageQueuedElementInputs\(job\)[\s\S]*?submissionState: 'submitting'[\s\S]*?queuePrompt\(job\.graph,[\s\S]*?promptId: pid/);
+  assert.match(server, /submitDurableGeneration[\s\S]*?submissionState: 'staging'[\s\S]*?stageQueuedInputs\(job\)[\s\S]*?submissionState: 'submitting'[\s\S]*?queuePrompt\(job\.graph,[\s\S]*?promptId: pid/);
   assert.match(server, /queuePrompt\(graph, options = \{\}\)[\s\S]*?assertWorkflowCapability\(options\.workflowContractId, graph, await getObjectInfo\(\)\)/);
   assert.match(server, /if \(stablePromptId\) body\.prompt_id = stablePromptId/);
   assert.ok(server.indexOf('trackJob(pid, job)') < server.indexOf('submitDurableGeneration(pid, job)'), 'intent is durable before staging or submission');
 });
 
 test('Element input manifests survive restart recovery and queue reorder', () => {
-  assert.match(server, /requeueMissingDurableJob[\s\S]*?elementInputNames: job\.elementInputNames/);
+  assert.match(server, /requeueMissingDurableJob[\s\S]*?stageQueuedInputs\(job\)[\s\S]*?elementInputNames: job\.elementInputNames/);
   assert.match(server, /requeueMissingDurableJob[\s\S]*?promptId: pid[\s\S]*?nextJobId: pid/);
   const reorder = server.slice(server.indexOf("route === '/api/queue/reorder'"), server.indexOf("route === '/api/queue/cancel'"));
-  assert.ok(reorder.indexOf('stageQueuedElementInputs') < reorder.indexOf('body: JSON.stringify({ delete: pendingIds })'));
-  assert.match(reorder, /elementInputNames: job\.elementInputNames/);
-  assert.match(reorder, /elementInputsStaged: true/);
+  assert.ok(reorder.indexOf('stageQueuedInputs') < reorder.indexOf('persistQueueReorderReceipt'));
+  assert.match(server, /inputAssets: queuedInputManifest\(profileId, \[\.\.\.refNames, \.\.\.elementInputNames/);
+  assert.match(reorder, /resumeQueueReorder\(\)/);
   assert.match(server, /elementNeedsAttention[\s\S]*?recoveryError[\s\S]*?attentionRequired: true/);
   assert.match(server, /requeueMissingDurableJob[\s\S]*?recoveryError\?\.attentionRequired\) return false/);
   assert.match(server, /const attentionRows = attentionQueueRows\(jobs,[\s\S]*?profileId: req\.profile\.id/);

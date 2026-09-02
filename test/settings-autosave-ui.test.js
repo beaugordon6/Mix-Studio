@@ -45,9 +45,9 @@ test('a pending app restart appears contextually beside the close button', () =>
   assert.match(app, /await waitForAppRestart\(previousInstanceId \|\| result\.instanceId\)/);
 });
 
-test('only a changed ComfyUI URL currently requests a Mix Studio restart', () => {
-  assert.match(server, /const APP_RESTART_SETTINGS_AT_BOOT = Object\.freeze\(\{ comfyUrl: settings\.comfyUrl \}\)/);
-  assert.match(server, /function settingsRequireAppRestart\(\) \{\s*return settings\.comfyUrl !== APP_RESTART_SETTINGS_AT_BOOT\.comfyUrl;\s*\}/);
+test('a ComfyUI port change reconnects live without requesting a Mix Studio restart', () => {
+  assert.doesNotMatch(server, /APP_RESTART_SETTINGS_AT_BOOT/);
+  assert.match(server, /function settingsRequireAppRestart\(\) \{[\s\S]{0,300}return false;\s*\}/);
   assert.match(server, /function settingsResponse\(\) \{[\s\S]*hfTokenConfigured:/);
   assert.match(server, /delete response\.hfToken;/);
   assert.match(server, /delete response\.externalLlmOpenAiApiKey;/);
@@ -56,6 +56,8 @@ test('only a changed ComfyUI URL currently requests a Mix Studio restart', () =>
   const postRoute = server.slice(server.indexOf("route === '/api/settings' && req.method === 'POST'"), server.indexOf("route === '/api/meta'"));
   assert.match(getRoute, /settingsResponse\(\)/);
   assert.match(postRoute, /settingsResponse\(\)/);
+  assert.match(postRoute, /const previousComfyUrl = settings\.comfyUrl;/);
+  assert.match(postRoute, /settings\.comfyUrl !== previousComfyUrl[\s\S]*resetComfyTransport\(\);[\s\S]*ensureComfyAvailability\('settings:endpoint-changed'\)/);
 });
 
 test('shared external prompt AI preferences autosave without exposing API keys', () => {

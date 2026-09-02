@@ -12,6 +12,7 @@ const fsp = fs.promises;
 const path = require('path');
 const os = require('os');
 const crypto = require('crypto');
+const { AsyncLocalStorage } = require('async_hooks');
 const { execFile, spawn } = require('child_process');
 const { pipeline } = require('stream/promises');
 const { gitCommand, readAppRelease, updateFromGit } = require('./lib/app-update');
@@ -78,6 +79,13 @@ const { discoverModels } = require('./installer/model-discovery');
 const { restartComfy, restartStatus, startComfy, startStatus } = require('./lib/comfy-restart');
 const { discoverComfyEndpoints, probeComfyUrl } = require('./lib/comfy-discovery');
 const { assertVerifiedComfyRuntime, attestComfyEndpoint } = require('./lib/comfy-runtime-identity');
+const { createComfyAvailabilitySupervisor } = require('./lib/comfy-availability-supervisor');
+const {
+  createQueueReorderReceipt,
+  planQueueReorder,
+  recordQueueReorderSubmitOutcome,
+  validateQueueReorderReceipt,
+} = require('./lib/durable-queue-reorder');
 const { decideComfySubmission } = require('./lib/comfy-submission-reconciler');
 const { durableCancellationDecision } = require('./lib/durable-cancellation');
 const { assertWorkflowCapability } = require('./lib/workflow-capabilities');
@@ -210,6 +218,14 @@ const {
   receiveInputFile,
   multipartFileUpload,
 } = require('./lib/input-assets');
+const {
+  createDurableInputStager,
+  createFileDurableInputManifestStore,
+} = require('./lib/durable-input-staging');
+const {
+  createDurableInputDeletionJournal,
+  createFileDurableInputDeletionReceiptStore,
+} = require('./lib/durable-input-deletion');
 const {
   uploadedAssetKind,
   uploadedAssetUsage,
@@ -455,6 +471,10 @@ const IMAGES = path.join(DATA, 'images');
 const VIDEOS = path.join(DATA, 'videos');
 const VIDEO_PREVIEWS = path.join(DATA, 'video-previews');
 const INPUTS = path.join(DATA, 'inputs');
+const DURABLE_INPUT_ASSETS = path.join(DATA, 'durable-input-assets');
+const DURABLE_INPUT_MANIFESTS = path.join(DATA, 'durable-input-manifests');
+const DURABLE_INPUT_DELETIONS = path.join(DATA, 'durable-input-deletions');
+const QUEUE_REORDER_FILE = path.join(DATA, 'queue-reorder.json');
 const FINALIZATION_STAGING = path.join(DATA, 'finalization-staging');
 const TRASH_ROOT = path.join(DATA, 'trash');
 const PROMPT_PACKS = path.join(DATA, 'addons', 'prompt-packs');
@@ -465,6 +485,9 @@ fs.mkdirSync(IMAGES, { recursive: true });
 fs.mkdirSync(VIDEOS, { recursive: true });
 fs.mkdirSync(VIDEO_PREVIEWS, { recursive: true });
 fs.mkdirSync(INPUTS, { recursive: true });
+fs.mkdirSync(DURABLE_INPUT_ASSETS, { recursive: true });
+fs.mkdirSync(DURABLE_INPUT_MANIFESTS, { recursive: true });
+fs.mkdirSync(DURABLE_INPUT_DELETIONS, { recursive: true });
 fs.mkdirSync(FINALIZATION_STAGING, { recursive: true });
 fs.mkdirSync(TRASH_ROOT, { recursive: true });
 fs.mkdirSync(PROMPT_PACKS, { recursive: true });
@@ -729,14 +752,16 @@ const storedSettingsMigration = migrateStoredSettings(loadJson(SETTINGS_FILE, {}
 let settings = normalizeSettings(Object.assign({}, DEFAULT_SETTINGS, storedSettingsMigration.stored));
 if (storedSettingsMigration.changed && fs.existsSync(SETTINGS_FILE)) saveJsonSync(SETTINGS_FILE, settings);
 let sparkAccess = normalizeSparkAccess(loadJson(SPARK_ACCESS_FILE, {}));
-const APP_RESTART_SETTINGS_AT_BOOT = Object.freeze({ comfyUrl: settings.comfyUrl });
 
 function saveSparkAccess() {
   saveJsonSync(SPARK_ACCESS_FILE, sparkAccess);
 }
 
 function settingsRequireAppRestart() {
-  return settings.comfyUrl !== APP_RESTART_SETTINGS_AT_BOOT.comfyUrl;
+  // ComfyUI endpoint changes are handled live by resetting the transport and
+  // re-attesting the selected runtime. A discovered port change must never
+  // send the owner into an unnecessary Mix Studio restart loop.
+  return false;
 }
 
 function settingsResponse() {
@@ -818,6 +843,14 @@ function seedVr2ModelDirs() {
 
 const DB_FILE = path.join(DATA, 'db.json');
 let db = loadJson(DB_FILE, { folders: [], items: [] });
+let queueReorderReceipt = null;
+let queueReorderLoadError = null;
+try {
+  const storedQueueReorder = loadJson(QUEUE_REORDER_FILE, null);
+  if (storedQueueReorder) queueReorderReceipt = validateQueueReorderReceipt(storedQueueReorder);
+} catch (error) {
+  queueReorderLoadError = error;
+}
 let dbSaveTimer = null;
 let dbRevision = 1;
 let mediaDeletionQueue = Promise.resolve();
@@ -832,6 +865,13 @@ function flushDbNow() {
   clearTimeout(dbSaveTimer);
   dbSaveTimer = null;
   saveJsonDurablySync(DB_FILE, db);
+}
+
+function persistQueueReorderReceipt(receipt) {
+  queueReorderReceipt = validateQueueReorderReceipt(receipt);
+  saveJsonDurablySync(QUEUE_REORDER_FILE, queueReorderReceipt);
+  queueReorderLoadError = null;
+  return queueReorderReceipt;
 }
 
 function durableGalleryTransaction(mutator) {
@@ -1110,6 +1150,113 @@ class DurableJobMap extends Map {
 }
 const recoveredLocalJobs = localJobJournal.entries();
 const jobs = new DurableJobMap(recoveredLocalJobs); // promptId -> job
+const durableInputManifestStore = createFileDurableInputManifestStore(DURABLE_INPUT_MANIFESTS);
+const durableInputStager = createDurableInputStager({
+  assetDirectory: DURABLE_INPUT_ASSETS,
+  manifestStore: durableInputManifestStore,
+  uploadFile: (file, name) => uploadFileToComfy(file, name),
+  classifyUploadError: (error) => ({
+    code: String(error?.code || 'comfy_input_stage_failed'),
+    message: String(error?.message || error || 'ComfyUI is unavailable.'),
+    retryable: ['comfy_connection_failed', 'comfy_runtime_unreachable', 'comfy_input_upload_failed']
+      .includes(String(error?.code || '')) || Number(error?.status) >= 500,
+  }),
+});
+const durableInputDeletionReceiptStore = createFileDurableInputDeletionReceiptStore(DURABLE_INPUT_DELETIONS);
+const durableInputDeletionJournal = createDurableInputDeletionJournal({
+  aliasDirectory: INPUTS,
+  assetDirectory: DURABLE_INPUT_ASSETS,
+  manifestDirectory: DURABLE_INPUT_MANIFESTS,
+  trashDirectory: TRASH_ROOT,
+  receiptStore: durableInputDeletionReceiptStore,
+});
+
+async function moveDurableInputAssetToTrash(asset, trash) {
+  await fsp.mkdir(trash, { recursive: true });
+  const token = `${Date.now()}_${String(asset?.id || crypto.randomBytes(4).toString('hex'))}`;
+  const candidates = [
+    { source: inputAssetPath(INPUTS, asset.name), label: `alias_${path.basename(asset.name)}` },
+  ];
+  if (asset.assetId) {
+    candidates.push(
+      { source: path.join(DURABLE_INPUT_ASSETS, `${asset.assetId}.bin`), label: `${asset.assetId}.bin` },
+      { source: path.join(DURABLE_INPUT_MANIFESTS, `${asset.assetId}.json`), label: `${asset.assetId}.json` },
+    );
+  }
+  for (const candidate of candidates) {
+    const destination = path.join(trash, `${token}_${candidate.label}`);
+    await fsp.rename(candidate.source, destination).catch((error) => {
+      if (error?.code !== 'ENOENT') throw error;
+    });
+  }
+}
+
+function durableInputDeletionRequest(asset) {
+  return {
+    profileId: asset.profileId,
+    assetId: asset.assetId,
+    name: asset.name,
+    aliases: [asset.name],
+  };
+}
+
+async function deleteUploadedAssetDurably(asset) {
+  if (!asset?.assetId) {
+    if (!asset?.deletedAt) {
+      const trash = path.join(TRASH_ROOT, 'uploaded-assets', asset.profileId);
+      await moveDurableInputAssetToTrash(asset, trash);
+      asset.deletedAt = Date.now();
+      flushDbNow();
+    }
+    return { status: 'legacy_complete' };
+  }
+  if (asset.deletedAt && !await durableInputDeletionReceiptStore.load(asset.assetId)) {
+    // This asset completed through the older recoverable-trash path before the
+    // journal existed. Its database tombstone remains authoritative.
+    return { status: 'legacy_complete' };
+  }
+  return durableInputDeletionJournal.checkpointCatalog(
+    durableInputDeletionRequest(asset),
+    async () => {
+      const catalogAsset = db.uploadedAssets.find((entry) => (
+        entry.id === asset.id && entry.profileId === asset.profileId
+      ));
+      if (!catalogAsset || catalogAsset.assetId !== asset.assetId || catalogAsset.name !== asset.name) {
+        const error = new Error('The uploaded asset catalog changed during recoverable deletion.');
+        error.code = 'durable_input_deletion_catalog_conflict';
+        throw error;
+      }
+      if (!catalogAsset.deletedAt) catalogAsset.deletedAt = Date.now();
+      // This durable flush is the journal's explicit catalog checkpoint. The
+      // callback cannot run until alias, blob, and manifest are verified in trash.
+      flushDbNow();
+    },
+  );
+}
+
+async function replayDurableInputDeletions() {
+  const receipts = await durableInputDeletionReceiptStore.list();
+  for (const receipt of receipts.filter((entry) => entry.catalogState !== 'committed')) {
+    const asset = db.uploadedAssets.find((entry) => (
+      entry.assetId === receipt.assetId
+      && entry.profileId === receipt.profileId
+      && entry.name === receipt.name
+    ));
+    if (!asset) {
+      console.error('[durable-input-delete] cannot replay receipt without its catalog asset:', receipt.assetId);
+      continue;
+    }
+    try {
+      await deleteUploadedAssetDurably(asset);
+    } catch (error) {
+      console.error('[durable-input-delete] replay needs attention:', receipt.assetId, error.message);
+    }
+  }
+}
+
+const durableInputDeletionRecovery = serializeMediaDeletion(replayDurableInputDeletions).catch((error) => {
+  console.error('[durable-input-delete] startup replay could not finish:', error.message);
+});
 const durableGalleryManifestStore = {
   async load(operationId) {
     const manifest = jobs.get(String(operationId))?.finalization;
@@ -1136,6 +1283,31 @@ const durableGalleryFinalizer = createGalleryFinalizationAdapter({
   databaseStore: { transaction: durableGalleryTransaction },
   historyLimit: 50,
 });
+const durableAttachmentReceiptStore = {
+  async load(operationId) {
+    const receipt = jobs.get(String(operationId))?.attachmentFinalization;
+    return receipt ? JSON.parse(JSON.stringify(receipt)) : null;
+  },
+  async save(receipt) {
+    const pid = String(receipt?.operationId || '');
+    const job = jobs.get(pid);
+    if (!job) {
+      const error = new Error(`Durable attachment ${pid} disappeared during finalization.`);
+      error.code = 'catalog_attachment_job_missing';
+      throw error;
+    }
+    persistJob(pid, {
+      attachmentFinalization: receipt,
+      submissionState: receipt.completed ? 'finalized'
+        : (receipt.phase === 'attention' ? 'attention' : 'finalizing'),
+    });
+  },
+};
+const durableAttachmentFinalizer = createCatalogAttachmentFinalizer({
+  mediaDirectory: IMAGES,
+  receiptStore: durableAttachmentReceiptStore,
+  databaseStore: { transaction: durableGalleryTransaction },
+});
 const externalPromptPreflights = new Map(); // synthetic id -> external prompt enhancement
 const queueHealthState = { lowGpuSince: null };
 let dependencyInstallRunning = false;
@@ -1152,6 +1324,9 @@ let comfySetupProcess = null;
 let comfySetupCancelRequested = false;
 let comfySetupExpectedBasePath = '';
 let comfyStartRunning = false;
+let comfyAvailabilitySupervisor = null;
+let comfySupervisorState = null;
+const comfyRecoveryContext = new AsyncLocalStorage();
 let comfyStartState = {
   state: 'idle',
   phase: 'idle',
@@ -1520,6 +1695,13 @@ function persistJob(pid, patch = {}) {
   return job;
 }
 
+const DURABLE_COMFY_JOB_KINDS = new Set(['gen', 'loraHunt', 'upscale']);
+
+function isDurableComfyJob(job) {
+  return !!job && DURABLE_COMFY_JOB_KINDS.has(job.kind)
+    && isCanonicalOperationId(job.operationId || job.promptId);
+}
+
 function jobBaseTime(job) {
   return job && (job.startedAt || job.enqueuedAt || job.createdAt) || Date.now();
 }
@@ -1529,8 +1711,9 @@ function jobDurationMs(job, now = Date.now()) {
 }
 
 async function requeueMissingDurableJob(pid, job) {
-  if (!job || job.requeueing || !['gen', 'loraHunt'].includes(job.kind) || !job.graph) return false;
-  if (job.finalization || ['output_ready', 'finalizing', 'finalized'].includes(job.submissionState)) return false;
+  if (!job || job.requeueing || !isDurableComfyJob(job) || !job.graph) return false;
+  if (job.finalization || job.attachmentFinalization
+    || ['output_ready', 'finalizing', 'finalized'].includes(job.submissionState)) return false;
   if (job.recoveryError?.attentionRequired) return false;
   job.requeueing = true;
   job.recoveryAttempts = Math.max(0, Number(job.recoveryAttempts) || 0) + 1;
@@ -1546,6 +1729,19 @@ async function requeueMissingDurableJob(pid, job) {
       submissionState: 'reconciling',
       lastReconciledAt: Date.now(),
     });
+    if (job.kind === 'upscale') {
+      await stageDurableUpscaleInput(job);
+      let receipt = childReceiptForJob(job);
+      if (receipt?.state === 'submitting') receipt = transitionChildReceipt(receipt, 'submission_unknown');
+      receipt = beginChildSubmission(receipt, { attemptId: crypto.randomUUID() });
+      persistUpscaleChildReceipt(pid, receipt, {
+        submissionState: 'submitting',
+        submissionAttemptId: receipt.submission.attemptId,
+        submitStartedAt: Date.now(),
+      });
+    } else if (['gen', 'loraHunt'].includes(job.kind)) {
+      await stageQueuedInputs(job);
+    }
     const nextPid = await queuePrompt(job.graph, {
       profileId: job.profileId,
       elementInputNames: job.elementInputNames,
@@ -1558,13 +1754,20 @@ async function requeueMissingDurableJob(pid, job) {
       error.code = 'comfy_prompt_id_mismatch';
       throw error;
     }
-    persistJob(pid, {
+    const submissionPatch = {
       startedAt: null,
       requeueing: false,
       submissionState: 'submitted',
       submittedAt: Date.now(),
       lastReconciledAt: Date.now(),
-    });
+    };
+    if (job.kind === 'upscale') {
+      const receipt = childReceiptForJob(job);
+      submissionPatch.childReceipts = [transitionChildReceipt(receipt, 'submitted', {
+        submission: Object.assign({}, receipt.submission, { acknowledgedAt: Date.now() }),
+      })];
+    }
+    persistJob(pid, submissionPatch);
     delete job.missingFromComfyAt;
     delete job.recoveryError;
     jobs.set(pid, job);
@@ -1575,9 +1778,11 @@ async function requeueMissingDurableJob(pid, job) {
   } catch (error) {
     const decision = error?.submissionDecision;
     const needsAttention = decision?.state === 'attention'
-      || ['element_asset_missing', 'element_asset_unavailable', 'comfy_prompt_id_mismatch'].includes(error?.code);
+      || ['element_asset_missing', 'element_asset_unavailable', 'comfy_prompt_id_mismatch',
+        'comfy_input_profile_mismatch', 'comfy_input_asset_missing', 'comfy_input_manifest_changed',
+        'upscale_source_missing', 'upscale_source_changed', 'upscale_input_renamed'].includes(error?.code);
     const elementNeedsAttention = ['element_asset_missing', 'element_asset_unavailable'].includes(error?.code);
-    persistJob(pid, {
+    const recoveryPatch = {
       requeueing: false,
       missingFromComfyAt: Date.now(),
       submissionState: needsAttention ? 'attention' : 'submission_unknown',
@@ -1587,7 +1792,21 @@ async function requeueMissingDurableJob(pid, job) {
       message: String(error.message || error),
       attentionRequired: true,
       } : undefined,
-    });
+    };
+    if (job.kind === 'upscale') {
+      const receipt = childReceiptForJob(job);
+      if (receipt && !['awaiting_recovery', 'attention'].includes(receipt.state)) {
+        recoveryPatch.childReceipts = [needsAttention
+          ? transitionChildReceipt(receipt, 'attention', {
+            error: { code: String(error?.code || 'upscale_recovery_attention'), message: String(error.message || error) },
+          })
+          : markChildAwaitingRecovery(receipt, {
+            resumeState: receipt.state === 'submitting' ? 'submission_unknown' : receipt.state,
+            reason: String(error.message || error),
+          })];
+      }
+    }
+    persistJob(pid, recoveryPatch);
     broadcast('status', {
       jobId: pid,
       profileId: job.profileId,
@@ -1697,7 +1916,139 @@ async function verifyConfiguredComfyRuntime() {
   return attestation;
 }
 
-async function comfyFetch(p, opts) {
+async function reconcilePreservedJobsAfterComfyRecovery() {
+  return comfyRecoveryContext.run(
+    { suppressRecovery: true },
+    reconcilePreservedJobsAfterComfyRecoveryInner,
+  );
+}
+
+async function reconcilePreservedJobsAfterComfyRecoveryInner() {
+  resetComfyTransport();
+  ensureWs();
+  await resumeQueueReorder();
+  const reorderingIds = activeQueueReorderIds();
+  for (const [pid, job] of [...jobs.entries()]) {
+    if (!isDurableComfyJob(job) || job.provider === 'runpod') continue;
+    if (reorderingIds.has(pid)) continue;
+    try {
+      // Output receipts are authoritative. Finish a produced attachment before
+      // settling a late cancellation so a completed upscale cannot disappear.
+      if (job.cancelRequested) {
+        if (job.kind === 'upscale' && job.attachmentFinalization
+          && await resumeDurableUpscaleFromLocal(pid, job)) continue;
+        await reconcileDurableCancellation(pid, job);
+        continue;
+      }
+      if (durableGenerationFinalizationEligible(pid, job)
+        && await resumeDurableGalleryFromLocal(pid, job)) continue;
+      if (await resumeDurableUpscaleFromLocal(pid, job)) continue;
+      const decision = await inspectComfySubmission(pid, {
+        localState: job.submissionState,
+        cancelTombstone: job.cancelTombstone,
+      });
+      if (decision.state === 'finalize') {
+        await completeJob(pid);
+        continue;
+      }
+      if (decision.state === 'submit') {
+        await requeueMissingDurableJob(pid, job);
+        continue;
+      }
+      if (decision.state === 'terminal' && ['remote_failed', 'remote_cancelled'].includes(decision.code)) {
+        failJob(pid, decision.code === 'remote_cancelled'
+          ? 'ComfyUI cancelled this preserved generation.'
+          : 'ComfyUI reported an execution error for this preserved generation.');
+      }
+    } catch (error) {
+      if (comfyErrorCanRecover(error)) throw error;
+      if (!jobs.has(pid)) continue;
+      const current = jobs.get(pid);
+      current.completing = false;
+      persistJob(pid, {
+        submissionState: 'attention',
+        recoveryError: {
+          code: String(error?.code || 'durable_job_recovery_attention'),
+          message: String(error?.message || error || 'This preserved job needs attention.'),
+          attentionRequired: true,
+        },
+      });
+      broadcast('status', {
+        jobId: pid,
+        profileId: current.profileId,
+        kind: current.kind,
+        text: 'This preserved job needs attention. Other queued work will continue recovering.',
+        itemId: current.itemId || null,
+      });
+    }
+  }
+}
+
+function getComfyAvailabilitySupervisor() {
+  if (comfyAvailabilitySupervisor) return comfyAvailabilitySupervisor;
+  comfyAvailabilitySupervisor = createComfyAvailabilitySupervisor({
+    getRuntime: () => RUNTIME,
+    getConfiguredUrl: () => settings.comfyUrl,
+    probe: (url) => probeComfyUrl(url, { timeoutMs: 1200 }),
+    discover: async ({ runtime }) => {
+      const discovery = await discoverComfyEndpoints(settings.comfyUrl, {
+        env: process.env,
+        platform: process.platform,
+        timeoutMs: 1200,
+        expectedBasePath: String(runtime?.comfy?.path || ''),
+      });
+      return discovery.matches;
+    },
+    attest: (url, { runtime }) => attestComfyEndpoint(runtime, url, {
+      platform: process.platform,
+      timeoutMs: 4000,
+    }),
+    adopt: async (url) => { adoptComfyEndpoint(url); },
+    startStatus: (runtime) => startStatus(runtime),
+    start: async ({ runtime }) => startComfy(runtime, (phase, message) => {
+      updateComfyStartState({ state: 'running', phase, message, error: null });
+    }),
+    wait: (ms) => pause(ms),
+    reconcile: reconcilePreservedJobsAfterComfyRecovery,
+    maxLaunchAttempts: 1,
+    readinessChecksPerAttempt: 180,
+    readinessIntervalMs: 1000,
+    onState: (next) => {
+      comfySupervisorState = next;
+      if (['starting', 'waiting', 'backoff'].includes(next.status)) comfyStartRunning = true;
+      if (['connected', 'attention'].includes(next.status)) comfyStartRunning = false;
+      broadcast('comfyAvailability', next);
+      if (next.status === 'connected') {
+        updateComfyStartState({
+          state: 'complete', phase: 'connected', message: next.message,
+          error: null, matches: [],
+        });
+      } else if (next.status === 'attention') {
+        updateComfyStartState({
+          state: 'error', phase: 'attention', message: next.message,
+          error: next.message, matches: [],
+        });
+      }
+    },
+  });
+  return comfyAvailabilitySupervisor;
+}
+
+function ensureComfyAvailability(reason) {
+  if (dependencyInstallRunning || comfyRestartRunning || comfySetupProcess) return null;
+  const supervisor = getComfyAvailabilitySupervisor();
+  // A manual start owns the same launch lane. Automatic callers may join an
+  // existing supervisor flight, but must never create a second process beside
+  // a manual launch.
+  if (comfyStartRunning && !supervisor.isRunning()) return null;
+  return supervisor.ensure(reason);
+}
+
+function comfyErrorCanRecover(error) {
+  return ['comfy_connection_failed', 'comfy_runtime_unreachable'].includes(String(error?.code || ''));
+}
+
+async function fetchFromConfiguredComfy(p, opts) {
   const method = String(opts?.method || 'GET').toUpperCase();
   if (!['GET', 'HEAD'].includes(method)) await verifyConfiguredComfyRuntime();
   const url = settings.comfyUrl.replace(/\/$/, '') + p;
@@ -1722,6 +2073,34 @@ async function comfyFetch(p, opts) {
     throw wrapped;
   }
   return res;
+}
+
+async function comfyFetch(p, opts) {
+  const method = String(opts?.method || 'GET').toUpperCase();
+  try {
+    return await fetchFromConfiguredComfy(p, opts);
+  } catch (error) {
+    if (!comfyErrorCanRecover(error)) throw error;
+    // Reconciliation is the operation that must complete before the supervisor
+    // resolves. Waiting for that same in-flight promise here would deadlock.
+    if (comfyRecoveryContext.getStore()?.suppressRecovery) throw error;
+    const recovery = ensureComfyAvailability(`request:${method}:${p}`);
+    if (!recovery) throw error;
+    const retryIsSafe = ['GET', 'HEAD'].includes(method)
+      || error.code === 'comfy_runtime_unreachable'
+      || (method === 'POST' && p === '/upload/image' && Buffer.isBuffer(opts?.body));
+    if (!retryIsSafe) {
+      // Stream bodies cannot be reused. The outer uploader awaits this shared
+      // recovery and constructs a fresh multipart stream for its retry.
+      error.recovery = recovery;
+      recovery.catch((recoveryError) => {
+        console.warn('[comfy-recovery]', recoveryError.code || recoveryError.message || recoveryError);
+      });
+      throw error;
+    }
+    await recovery;
+    return fetchFromConfiguredComfy(p, opts);
+  }
 }
 
 async function inspectComfySubmission(promptId, options = {}) {
@@ -2412,7 +2791,8 @@ async function uploadFileToComfy(file, filename) {
         throw wrapped;
       }
       resetComfyTransport();
-      await pause(750);
+      if (error.recovery) await error.recovery;
+      else await pause(750);
     }
   }
   throw new Error(`Could not upload ${filename} to ComfyUI.`);
@@ -2493,6 +2873,213 @@ async function stageQueuedElementInputs(job) {
   });
 }
 
+function queuedInputNames(job) {
+  return [...new Set([
+    ...(Array.isArray(job?.refImageNames) ? job.refImageNames : []),
+    ...(Array.isArray(job?.elementInputNames) ? job.elementInputNames : []),
+    job?.params?.maskImageName,
+  ].map((value) => String(value || '').trim()).filter(Boolean))];
+}
+
+function queuedInputManifest(profileId, names) {
+  return [...new Set((names || []).map((value) => String(value || '').trim()).filter(Boolean))]
+    .map((name) => {
+      const asset = db.uploadedAssets.find((entry) => (
+        entry?.name === name && entry.profileId === profileId && !entry.deletedAt
+      ));
+      return {
+        name,
+        assetId: String(asset?.assetId || ''),
+        sha256: String(asset?.sha256 || ''),
+        bytes: Number(asset?.size) || 0,
+      };
+    });
+}
+
+async function stageQueuedInputs(job) {
+  const names = queuedInputNames(job);
+  if (!names.length) return [];
+  const staged = [];
+  for (const name of names) {
+    const matches = db.uploadedAssets.filter((asset) => asset?.name === name && !asset.deletedAt);
+    const owned = matches.find((asset) => asset.profileId === job.profileId);
+    if (!owned) {
+      const error = new Error(matches.length
+        ? 'This input belongs to a different Mix Studio profile.'
+        : 'This saved input is no longer available in Mix Studio. Upload it again before retrying.');
+      error.code = matches.length ? 'comfy_input_profile_mismatch' : 'comfy_input_asset_missing';
+      error.status = 409;
+      throw error;
+    }
+    const declared = Array.isArray(job.inputAssets)
+      ? job.inputAssets.find((asset) => asset?.name === name) : null;
+    if (declared?.assetId && (declared.assetId !== owned.assetId
+      || declared.sha256 !== owned.sha256 || Number(declared.bytes) !== Number(owned.size))) {
+      const error = new Error('This saved input no longer matches the immutable generation request.');
+      error.code = 'comfy_input_manifest_changed';
+      error.status = 409;
+      throw error;
+    }
+    if (owned.assetId) {
+      const result = await durableInputStager.stageFile({
+        profileId: job.profileId,
+        assetId: owned.assetId,
+        name,
+        sha256: owned.sha256,
+      });
+      if (result.state !== 'staged') {
+        const error = new Error(result.error?.message || 'This input is preserved and waiting for ComfyUI.');
+        error.code = result.error?.code || 'comfy_input_stage_waiting';
+        error.status = result.error?.retryable === false ? 409 : 503;
+        throw error;
+      }
+    } else {
+      const local = inputAssetPath(INPUTS, name);
+      const uploaded = await uploadFileToComfy(local, name);
+      if (uploaded !== name) {
+        const error = new Error('ComfyUI changed the saved input name; submission was stopped.');
+        error.code = 'comfy_input_name_changed';
+        error.status = 502;
+        throw error;
+      }
+    }
+    staged.push(name);
+  }
+  return staged;
+}
+
+let queueReorderRunning = false;
+
+function activeQueueReorderIds() {
+  if (!queueReorderReceipt || queueReorderReceipt.phase === 'complete') return new Set();
+  return new Set(queueReorderReceipt.order || []);
+}
+
+async function inspectQueueReorderSnapshot(receipt) {
+  try {
+    const queue = await (await comfyFetch('/queue')).json();
+    const historyParts = await Promise.all(receipt.order.map(async (promptId) => (
+      (await comfyFetch(`/history/${encodeURIComponent(promptId)}`)).json()
+    )));
+    return {
+      queue: { ok: true, value: queue },
+      history: { ok: true, value: Object.assign({}, ...historyParts) },
+    };
+  } catch (error) {
+    if (comfyRecoveryContext.getStore()?.suppressRecovery && comfyErrorCanRecover(error)) throw error;
+    return {
+      queue: { ok: false, offline: comfyErrorCanRecover(error), code: String(error?.code || 'inspection_failed') },
+      history: { ok: false, offline: comfyErrorCanRecover(error), code: String(error?.code || 'inspection_failed') },
+    };
+  }
+}
+
+async function resumeQueueReorder() {
+  if (queueReorderRunning) {
+    return { state: queueReorderReceipt?.phase || 'idle', receipt: queueReorderReceipt };
+  }
+  if (queueReorderLoadError) {
+    return { state: 'attention', code: 'queue_reorder_receipt_corrupt', error: queueReorderLoadError };
+  }
+  if (!queueReorderReceipt || ['complete', 'attention'].includes(queueReorderReceipt.phase)) {
+    return { state: queueReorderReceipt?.phase || 'idle', receipt: queueReorderReceipt };
+  }
+  queueReorderRunning = true;
+  try {
+    const maxTransitions = Math.max(12, queueReorderReceipt.order.length * 8 + 8);
+    for (let transition = 0; transition < maxTransitions; transition += 1) {
+      const snapshot = await inspectQueueReorderSnapshot(queueReorderReceipt);
+      const plan = planQueueReorder(queueReorderReceipt, snapshot, { now: Date.now() });
+      if (plan.type === 'checkpoint' || plan.type === 'attention') {
+        persistQueueReorderReceipt(plan.receipt);
+        if (plan.type === 'attention') {
+          return { state: 'attention', code: plan.code, receipt: queueReorderReceipt };
+        }
+        if (queueReorderReceipt.phase === 'complete') {
+          broadcast('queueReordered', { profileId: queueReorderReceipt.profileId });
+          return { state: 'complete', receipt: queueReorderReceipt };
+        }
+        continue;
+      }
+      if (plan.type === 'complete') {
+        return { state: 'complete', receipt: queueReorderReceipt };
+      }
+      if (plan.type === 'wait') {
+        return { state: 'waiting', code: plan.code, receipt: queueReorderReceipt };
+      }
+      if (plan.type === 'cancel_pending') {
+        try {
+          await comfyFetch('/queue', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ delete: plan.promptIds }),
+          });
+        } catch (error) {
+          if (!comfyErrorCanRecover(error)) throw error;
+          return {
+            state: 'waiting', code: 'queue_reorder_cancellation_ambiguous',
+            error, receipt: queueReorderReceipt,
+          };
+        }
+        continue;
+      }
+      if (plan.type === 'submit') {
+        let job = jobs.get(plan.promptId);
+        if (!job || job.profileId !== queueReorderReceipt.profileId || !job.graph) {
+          const failed = recordQueueReorderSubmitOutcome(
+            queueReorderReceipt, plan.promptId, 'rejected', { now: Date.now() },
+          );
+          persistQueueReorderReceipt(failed);
+          return { state: 'attention', code: 'queue_reorder_job_missing', receipt: queueReorderReceipt };
+        }
+        try {
+          await stageQueuedInputs(job);
+          // Cancellation and reset are blocked while the receipt is active,
+          // but re-read after staging as a final invariant before remote I/O.
+          job = jobs.get(plan.promptId);
+          if (!job || job.cancelRequested || job.profileId !== queueReorderReceipt.profileId) {
+            const cancelled = new Error('This queued job was cancelled while its reorder was being prepared.');
+            cancelled.code = 'queue_reorder_job_cancelled';
+            throw cancelled;
+          }
+          const submittedId = await queuePrompt(job.graph, {
+            profileId: job.profileId,
+            elementInputNames: job.elementInputNames,
+            elementInputsStaged: true,
+            workflowContractId: job.workflowContractId,
+            promptId: plan.promptId,
+            localState: plan.retry ? 'submission_unknown' : 'submitting',
+            cancelTombstone: job.cancelRequested === true,
+          });
+          if (submittedId !== plan.promptId) {
+            const mismatch = new Error('ComfyUI changed a stable prompt ID during queue reorder.');
+            mismatch.code = 'comfy_prompt_id_mismatch';
+            throw mismatch;
+          }
+          persistQueueReorderReceipt(recordQueueReorderSubmitOutcome(
+            queueReorderReceipt, plan.promptId, 'acknowledged', { now: Date.now() },
+          ));
+        } catch (error) {
+          const ambiguous = comfyErrorCanRecover(error)
+            || String(error?.submissionDecision?.state || '') === 'wait';
+          persistQueueReorderReceipt(recordQueueReorderSubmitOutcome(
+            queueReorderReceipt, plan.promptId, ambiguous ? 'ambiguous' : 'rejected', { now: Date.now() },
+          ));
+          return {
+            state: ambiguous ? 'waiting' : 'attention',
+            code: String(error?.code || (ambiguous ? 'queue_reorder_submission_ambiguous' : 'queue_reorder_submission_rejected')),
+            error,
+            receipt: queueReorderReceipt,
+          };
+        }
+      }
+    }
+    return { state: 'waiting', code: 'queue_reorder_transition_budget', receipt: queueReorderReceipt };
+  } finally {
+    queueReorderRunning = false;
+  }
+}
+
 /* --------------------------- WebSocket ---------------------------- */
 
 let ws = null;
@@ -2555,7 +3142,12 @@ function ensureWs() {
       }
     }
   };
-  ws.onclose = scheduleWsRetry;
+  ws.onclose = () => {
+    scheduleWsRetry();
+    ensureComfyAvailability('websocket_closed')?.catch((error) => {
+      console.warn('[comfy-recovery]', error.code || error.message || error);
+    });
+  };
   ws.onerror = () => { try { ws.close(); } catch { /* noop */ } };
 }
 function scheduleWsRetry() {
@@ -2583,7 +3175,7 @@ function handleWsMessage(msg) {
     activeWsPromptId = d.node === null ? '' : pid;
     if (job && d.node !== null && !job.startedAt) job.startedAt = Date.now();
     if (d.node === null) {
-      if (job?.cancelRequested && ['gen', 'loraHunt'].includes(job.kind)) {
+      if (job?.cancelRequested && isDurableComfyJob(job)) {
         reconcileDurableCancellation(pid, job).catch(() => { /* polling retains and retries the tombstone */ });
       } else {
         completeJob(pid).catch((error) => handleCompletionFailure(pid, error));
@@ -2645,10 +3237,12 @@ function clearPendingJobState(job) {
     fsp.unlink(temporarySourcePath).catch(() => {});
   }
   if (job.kind === 'upscale' && job.itemId) {
-    const item = db.items.find((entry) => entry.id === job.itemId);
+    const item = db.items.find((entry) => entry.id === job.itemId && entry.profileId === job.profileId);
     if (item && item.upscalePending) {
       item.upscalePending = false;
-      saveDb();
+      delete item.upscalePendingOperationId;
+      if (isDurableComfyJob(job)) flushDbNow();
+      else saveDb();
     }
   }
 }
@@ -2690,7 +3284,7 @@ function observedCancellationState(decision) {
 }
 
 async function reconcileDurableCancellation(pid, job) {
-  if (!job || !['gen', 'loraHunt'].includes(job.kind) || !job.cancelRequested) {
+  if (!isDurableComfyJob(job) || !job.cancelRequested) {
     return { settled: false, pending: false };
   }
   if (job.cancellationReconciling) return { settled: false, pending: true };
@@ -2774,8 +3368,8 @@ function cancelJob(pid, message = 'Cancelled') {
   if (!job) return false;
   const durationMs = jobDurationMs(job);
   failSmartJob(job, message, true);
-  jobs.delete(pid);
   clearPendingJobState(job);
+  jobs.delete(pid);
   broadcast('jobCancelled', {
     jobId: pid,
     kind: job.kind,
@@ -2797,12 +3391,12 @@ function failJob(pid, message) {
   const job = jobs.get(pid);
   const durationMs = job ? jobDurationMs(job) : undefined;
   failSmartJob(job, message, false);
+  clearPendingJobState(job);
   jobs.delete(pid);
   if (job && (job.kind === 'enhance' || job.kind === 'motionPrompt' || job.kind === 'smartMask')) {
     job.reject(new Error(message));
     return;
   }
-  clearPendingJobState(job);
   pushHistory({ kind: 'error', profileId: job ? job.profileId : undefined, itemId: job ? (job.itemId || null) : null, label: `${jobLabel(job)} — ${String(message).slice(0, 80)}` });
   broadcast('jobError', {
     jobId: pid,
@@ -3106,7 +3700,6 @@ function durableGenerationFinalizationEligible(pid, job) {
   return job?.kind === 'gen'
     && isCanonicalOperationId(job.operationId || pid)
     && String(job.operationId || pid) === String(pid)
-    && !job.params?.postUpscale
     && !job.params?.editSequence
     && !job.smartRunId;
 }
@@ -3166,6 +3759,8 @@ function cleanupDurableOutputStaging(manifest) {
 function finalizationNeedsAttention(error) {
   const code = String(error?.code || '');
   if (code.startsWith('finalization_')) return true;
+  if (code.startsWith('catalog_attachment_')
+    && !['catalog_attachment_database_write_failed'].includes(code)) return true;
   return new Set([
     'gallery_finalization_conflict',
     'gallery_finalization_operation_id_invalid',
@@ -3216,14 +3811,42 @@ function deferDurableFinalization(pid, job, error) {
 
 function handleCompletionFailure(pid, error) {
   const job = jobs.get(pid);
-  if (durableGenerationFinalizationEligible(pid, job)) {
+  if (durableGenerationFinalizationEligible(pid, job)
+    || (isDurableComfyJob(job) && ['loraHunt', 'upscale'].includes(job.kind))) {
     deferDurableFinalization(pid, job, error);
     return;
   }
   failJob(pid, error?.message || 'Could not finalize ComfyUI output');
 }
 
-function settleDurableGalleryResult(pid, job, result) {
+async function ensurePostUpscaleChildren(pid, job, items) {
+  if (!job.params?.postUpscale) return;
+  const receipts = Array.isArray(job.childReceipts) ? [...job.childReceipts] : [];
+  for (let ordinal = 0; ordinal < items.length; ordinal += 1) {
+    const item = items[ordinal];
+    let receipt = receipts.find((entry) => entry.relation === 'post_upscale' && entry.ordinal === ordinal);
+    if (!receipt) {
+      receipt = createChildReceipt({
+        id: crypto.randomUUID(),
+        parentId: job.operationId || pid,
+        relation: 'post_upscale',
+        ordinal,
+        profileId: job.profileId,
+        intent: {
+          itemId: item.id,
+          sourceFile: item.file,
+          upscaleInfo: job.params.postUpscale,
+        },
+      });
+      receipts.push(receipt);
+      persistJob(pid, { childReceipts: receipts });
+    }
+    if (item.upscaleReceipt?.operationId === receipt.id || jobs.has(receipt.id)) continue;
+    await queueDurableUpscale(item, job.params.postUpscale, job.profileId, receipt);
+  }
+}
+
+async function settleDurableGalleryResult(pid, job, result) {
   if (result.status === 'cancelled') {
     cancelJob(pid, job.cancelMessage || 'Cancelled by user');
     return true;
@@ -3241,6 +3864,12 @@ function settleDurableGalleryResult(pid, job, result) {
   if (created.length !== result.manifest.outputs.length) {
     const error = new Error('A finalized gallery item is missing from the durable database commit.');
     error.code = 'gallery_finalization_catalog_mismatch';
+    deferDurableFinalization(pid, job, error);
+    return true;
+  }
+  try {
+    await ensurePostUpscaleChildren(pid, job, created);
+  } catch (error) {
     deferDurableFinalization(pid, job, error);
     return true;
   }
@@ -3271,17 +3900,165 @@ async function resumeDurableGalleryFromLocal(pid, job) {
       manifest: job.finalization,
       outputs: descriptors,
     });
-    return settleDurableGalleryResult(pid, job, result);
+    return await settleDurableGalleryResult(pid, job, result);
   } catch (error) {
     deferDurableFinalization(pid, job, error);
     return true;
   }
 }
 
+function durableUpscaleDescriptor(job, content, durationMs) {
+  const item = db.items.find((entry) => entry.id === job.itemId && entry.profileId === job.profileId);
+  if (!item) {
+    const error = new Error('The source gallery item for this preserved upscale no longer exists.');
+    error.code = 'catalog_attachment_target_missing';
+    throw error;
+  }
+  const createdAt = Number(job.attachmentDescriptor?.createdAt) || Date.now();
+  return {
+    operationId: job.operationId,
+    strategy: 'replace_upscale',
+    profileId: job.profileId,
+    target: {
+      itemId: job.itemId,
+      sourceVersion: {
+        file: job.sourceAsset?.file || item.file,
+        attachment: job.sourceAsset?.previousAttachment || null,
+        receiptId: job.sourceAsset?.previousReceiptId || null,
+        sha256: job.sourceAsset?.sha256,
+        bytes: job.sourceAsset?.bytes,
+      },
+    },
+    output: {
+      extension: '.png',
+      sha256: job.attachmentFinalization?.output?.sha256 || hashAsset(content),
+      bytes: job.attachmentFinalization?.output?.bytes ?? content.length,
+      content,
+    },
+    history: {
+      kind: 'upscale',
+      durationMs,
+      label: `Upscaled: ${(item.prompt || '').slice(0, 60)}`,
+      ts: createdAt,
+    },
+    attachment: { upscaleInfo: job.upscaleInfo || {}, durationMs },
+    createdAt,
+    cancelRequested: job.cancelRequested === true,
+  };
+}
+
+function settleDurableUpscaleResult(pid, job, result) {
+  if (result.status === 'cancelled') {
+    cancelJob(pid, job.cancelMessage || 'Cancelled by user');
+    return true;
+  }
+  if (result.status === 'attention') {
+    const error = new Error('The preserved upscale conflicts with the current gallery item.');
+    error.code = 'catalog_attachment_conflict';
+    deferDurableFinalization(pid, job, error);
+    return true;
+  }
+  if (result.status !== 'complete') return false;
+  const item = db.items.find((entry) => entry.id === job.itemId && entry.profileId === job.profileId);
+  if (!item || item.upscaleReceipt?.operationId !== job.operationId) {
+    const error = new Error('The finalized upscale is missing from its gallery item.');
+    error.code = 'catalog_attachment_catalog_mismatch';
+    deferDurableFinalization(pid, job, error);
+    return true;
+  }
+  let receipt = childReceiptForJob(job);
+  if (receipt && receipt.state !== 'finalized') {
+    if (receipt.state !== 'finalizing') receipt = transitionChildReceipt(receipt, 'finalizing');
+    receipt = transitionChildReceipt(receipt, 'finalized', {
+      result: {
+        attachmentReceiptId: result.receipt.receiptId,
+        filename: result.receipt.output.filename,
+        sha256: result.receipt.output.sha256,
+        bytes: result.receipt.output.bytes,
+      },
+    });
+    persistUpscaleChildReceipt(pid, receipt, { submissionState: 'finalized' });
+  }
+  fsp.unlink(finalizationStagingPath(job.operationId, 0)).catch(() => {});
+  jobs.delete(pid);
+  broadcast('upscaleDone', { jobId: pid, item });
+  return true;
+}
+
+async function finalizeDurableUpscale(pid, job, content, durationMs) {
+  const descriptor = durableUpscaleDescriptor(job, content, durationMs);
+  const requested = createCatalogAttachmentReceipt(descriptor);
+  let childReceipt = childReceiptForJob(job);
+  if (childReceipt && childReceipt.state !== 'finalizing' && childReceipt.state !== 'finalized') {
+    childReceipt = transitionChildReceipt(childReceipt, 'finalizing');
+  }
+  if (job.attachmentFinalization) {
+    if (job.attachmentFinalization.output?.sha256 !== requested.output.sha256
+      || job.attachmentFinalization.output?.bytes !== requested.output.bytes) {
+      const error = new Error('The resumed upscale output no longer matches its durable receipt.');
+      error.code = 'catalog_attachment_content_mismatch';
+      throw error;
+    }
+    if (childReceipt) persistUpscaleChildReceipt(pid, childReceipt, { submissionState: 'finalizing' });
+  } else {
+    persistJob(pid, {
+      attachmentFinalization: requested,
+      attachmentDescriptor: { ...descriptor, output: { ...descriptor.output, content: undefined } },
+      childReceipts: childReceipt ? [childReceipt] : job.childReceipts,
+      submissionState: 'finalizing',
+    });
+  }
+  await stageDurableOutput(job.operationId, { ...requested.output, outputIndex: 0 }, content);
+  const result = await durableAttachmentFinalizer.finalize(descriptor);
+  return settleDurableUpscaleResult(pid, job, result);
+}
+
+async function resumeDurableUpscaleFromLocal(pid, job) {
+  if (job?.kind !== 'upscale' || !job.attachmentFinalization || job.completing) return false;
+  if (job.recoveryError?.attentionRequired) return true;
+  const output = { ...job.attachmentFinalization.output, outputIndex: 0 };
+  let content = await stagedDurableOutput(job.operationId, output);
+  if (!content) {
+    try { await fsp.access(path.join(IMAGES, output.filename)); }
+    catch { return false; }
+    content = Buffer.alloc(0);
+  }
+  job.completing = true;
+  try {
+    const descriptor = JSON.parse(JSON.stringify(job.attachmentDescriptor || {}));
+    descriptor.output = { ...(descriptor.output || {}), content };
+    descriptor.cancelRequested = job.cancelRequested === true;
+    const result = await durableAttachmentFinalizer.finalize(descriptor);
+    return settleDurableUpscaleResult(pid, job, result);
+  } catch (error) {
+    deferDurableFinalization(pid, job, error);
+    return true;
+  }
+}
+
+function markUpscaleChildOutputReady(pid, job) {
+  let receipt = childReceiptForJob(job);
+  if (!receipt || ['output_ready', 'finalizing', 'finalized'].includes(receipt.state)) return receipt;
+  if (['submitting', 'submission_unknown'].includes(receipt.state)) {
+    receipt = transitionChildReceipt(receipt, 'submitted', {
+      submission: Object.assign({}, receipt.submission, {
+        acknowledgedAt: receipt.submission.acknowledgedAt || Date.now(),
+      }),
+    });
+  }
+  receipt = transitionChildReceipt(receipt, 'output_ready');
+  persistUpscaleChildReceipt(pid, receipt, { submissionState: 'output_ready', recoveryError: undefined });
+  return receipt;
+}
+
 async function completeJob(pid) {
   const job = jobs.get(pid);
   if (!job) return;
-  if (job.cancelRequested && ['gen', 'loraHunt'].includes(job.kind)) {
+  if (job.cancelRequested && isDurableComfyJob(job)) {
+    if (job.kind === 'upscale' && job.attachmentFinalization) {
+      job.completing = false;
+      if (await resumeDurableUpscaleFromLocal(pid, job)) return;
+    }
     await reconcileDurableCancellation(pid, job);
     return;
   }
@@ -3320,23 +4097,25 @@ async function completeJob(pid) {
     const res = await comfyFetch(`/history/${pid}`);
     hist = (await res.json())[pid];
   } catch (error) {
-    if (durableGenerationFinalizationEligible(pid, job)) {
+    if (isDurableComfyJob(job)) {
       deferDurableFinalization(pid, job, error);
       return;
     }
     throw error;
   }
   if (!hist) {
-    if (durableGenerationFinalizationEligible(pid, job)) {
+    if (isDurableComfyJob(job)) {
       job.completing = false;
       if (await resumeDurableGalleryFromLocal(pid, job)) return;
+      if (await resumeDurableUpscaleFromLocal(pid, job)) return;
       deferDurableFinalization(pid, job, new Error('Waiting for the original ComfyUI output history.'));
       return;
     }
     return failJob(pid, 'No history entry from ComfyUI');
   }
-  if (durableGenerationFinalizationEligible(pid, job)) {
-    persistJob(pid, { submissionState: 'output_ready', recoveryError: undefined });
+  if (isDurableComfyJob(job)) {
+    if (job.kind === 'upscale') markUpscaleChildOutputReady(pid, job);
+    else persistJob(pid, { submissionState: 'output_ready', recoveryError: undefined });
   }
   const outputs = hist.outputs || {};
 
@@ -3561,7 +4340,11 @@ async function completeJob(pid) {
   }
 
   if (job.kind === 'upscale') {
-    const buf = await downloadOutput(files[0]);
+    const buf = isDurableComfyJob(job) ? await downloadImageOutput(files[0]) : await downloadOutput(files[0]);
+    if (isDurableComfyJob(job)) {
+      await finalizeDurableUpscale(pid, job, buf, durationMs);
+      return;
+    }
     const item = db.items.find((it) => it.id === job.itemId);
     if (!item) return failJob(pid, 'Gallery item no longer exists');
     const fname = `${item.id}_up.png`;
@@ -3849,7 +4632,7 @@ async function completeJob(pid) {
         manifest: job.finalization,
         outputs: durableDescriptors,
       });
-      settleDurableGalleryResult(pid, job, result);
+      await settleDurableGalleryResult(pid, job, result);
     } catch (error) {
       deferDurableFinalization(pid, job, error);
     }
@@ -3897,7 +4680,10 @@ async function completeJob(pid) {
 
 /* Polling fallback: no native WebSocket (Node < 22) OR the WS connection is down. */
 setInterval(async () => {
-  if (!jobs.size) return;
+  if (!jobs.size && !activeQueueReorderIds().size) return;
+  try { await resumeQueueReorder(); }
+  catch { /* the durable receipt remains available for the next reconciliation */ }
+  const reorderingIds = activeQueueReorderIds();
   const socketOpen = typeof WebSocket !== 'undefined' && ws && ws.readyState === 1;
   const socketStale = socketOpen && Date.now() - lastWsMessageAt > 15_000;
   const needsTextReconciliation = [...jobs.values()]
@@ -3914,22 +4700,26 @@ setInterval(async () => {
   }
   let livePromptIds = null;
   for (const pid of [...jobs.keys()]) {
+    if (reorderingIds.has(pid)) continue;
     try {
       const durableJob = jobs.get(pid);
-      if (durableJob?.cancelRequested && ['gen', 'loraHunt'].includes(durableJob.kind)) {
+      if (durableJob?.cancelRequested && isDurableComfyJob(durableJob)) {
+        if (durableJob.kind === 'upscale' && durableJob.attachmentFinalization
+          && await resumeDurableUpscaleFromLocal(pid, durableJob)) continue;
         await reconcileDurableCancellation(pid, durableJob);
         continue;
       }
       if (Number(durableJob?.finalizationRetryAt) > Date.now()) continue;
       if (durableGenerationFinalizationEligible(pid, durableJob)
         && await resumeDurableGalleryFromLocal(pid, durableJob)) continue;
+      if (await resumeDurableUpscaleFromLocal(pid, durableJob)) continue;
       const hist = (await (await comfyFetch(`/history/${pid}`)).json())[pid];
       if (hist && hist.status && hist.status.completed) await completeJob(pid);
       else if (hist && hist.status && hist.status.status_str === 'error') failJob(pid, 'Execution error (see ComfyUI console)');
       else {
         const job = jobs.get(pid);
         if (!job || job.provider === 'runpod') continue;
-        if (['staging', 'submitting', 'reconciling'].includes(job.submissionState)) continue;
+        if (job.requeueing) continue;
         if (!livePromptIds) {
           const queue = await (await comfyFetch('/queue')).json();
           livePromptIds = new Set([...(queue.queue_running || []), ...(queue.queue_pending || [])]
@@ -3941,7 +4731,7 @@ setInterval(async () => {
           job.missingFromComfyAt = Date.now();
         } else if (Date.now() - job.missingFromComfyAt >= 10_000) {
           if (!await requeueMissingDurableJob(pid, job)) {
-            if (!['gen', 'loraHunt'].includes(job.kind)) {
+            if (!isDurableComfyJob(job)) {
               failJob(pid, 'ComfyUI restarted before this operation completed. Its source settings are still available to retry.');
             }
           }
@@ -3953,6 +4743,17 @@ setInterval(async () => {
     }
   }
 }, 2500);
+
+// Keep the configured local generation service available even while the queue
+// is idle. The lightweight probe avoids repeated process discovery; the
+// supervisor performs full identity verification before it starts or adopts.
+setInterval(async () => {
+  if (dependencyInstallRunning || comfyRestartRunning || comfySetupProcess) return;
+  if (await probeComfyUrl(settings.comfyUrl, { timeoutMs: 1200 })) return;
+  ensureComfyAvailability('health_probe_failed')?.catch((error) => {
+    console.warn('[comfy-recovery]', error.code || error.message || error);
+  });
+}, 15_000).unref();
 
 /* ------------------------------------------------------------------ */
 /* Prompt enhance (two-pass): run TextGenerate alone, sanitize the     */
@@ -5752,15 +6553,16 @@ function preserveDurableSubmission(error) {
   if (error?.submissionDecision) return true;
   if (Number(error?.status) >= 500) return true;
   return ['comfy_connection_failed', 'comfy_prompt_id_mismatch', 'element_asset_missing',
-    'element_asset_unavailable', 'comfy_runtime_mismatch', 'comfy_runtime_unverifiable']
+    'element_asset_unavailable', 'comfy_input_profile_mismatch', 'comfy_input_asset_missing',
+    'comfy_input_manifest_changed', 'comfy_runtime_mismatch', 'comfy_runtime_unverifiable']
     .includes(String(error?.code || ''));
 }
 
 async function submitDurableGeneration(pid, job) {
   try {
-    if (job.elementInputNames.length) {
+    if (queuedInputNames(job).length) {
       persistJob(pid, { submissionState: 'staging' });
-      await stageQueuedElementInputs(job);
+      await stageQueuedInputs(job);
       persistJob(pid, { submissionState: 'staged', stagedAt: Date.now() });
     }
     const submissionAttemptId = crypto.randomUUID();
@@ -5798,6 +6600,7 @@ async function submitDurableGeneration(pid, job) {
     }
     const needsAttention = error?.submissionDecision?.state === 'attention'
       || ['comfy_prompt_id_mismatch', 'element_asset_missing', 'element_asset_unavailable',
+        'comfy_input_profile_mismatch', 'comfy_input_asset_missing', 'comfy_input_manifest_changed',
         'comfy_runtime_mismatch', 'comfy_runtime_unverifiable'].includes(String(error?.code || ''));
     persistJob(pid, {
       submissionState: needsAttention ? 'attention' : 'submission_unknown',
@@ -5833,7 +6636,9 @@ async function queueGenerationJob(p, profileId, refNames, refinedPrompt = null) 
   const pid = crypto.randomUUID();
   const job = {
     kind: 'gen', profileId, params: p, graph, refImageNames: refNames,
-    elementInputNames, workflowContractId, refinedPrompt, operationId: pid, promptId: pid,
+    elementInputNames,
+    inputAssets: queuedInputManifest(profileId, [...refNames, ...elementInputNames, p.maskImageName]),
+    workflowContractId, refinedPrompt, operationId: pid, promptId: pid,
     submissionState: 'prepared',
   };
   trackJob(pid, job);
@@ -5863,7 +6668,9 @@ async function queueStrengthHuntJob(p, profileId, refNames, refinedPrompt = null
   const pid = crypto.randomUUID();
   const job = {
     kind: 'loraHunt', profileId, params: Object.assign({}, p, { batch: 1, postUpscale: undefined }),
-    graph, refImageNames: refNames, elementInputNames, workflowContractId, refinedPrompt, huntPlan,
+    graph, refImageNames: refNames, elementInputNames,
+    inputAssets: queuedInputManifest(profileId, [...refNames, ...elementInputNames, p.maskImageName]),
+    workflowContractId, refinedPrompt, huntPlan,
     operationId: pid, promptId: pid, submissionState: 'prepared',
   };
   trackJob(pid, job);
@@ -6059,15 +6866,160 @@ function normalizePostUpscale(value) {
   };
 }
 
-async function queuePostUpscale(item, options, profileId) {
-  const buf = await fsp.readFile(path.join(IMAGES, item.file));
-  const comfyName = await uploadToComfy(buf, `ks_finish_${item.id}.png`);
-  const graph = await buildUpscale(comfyName, options);
-  const pid = await queuePrompt(graph, { profileId });
-  item.upscalePending = true;
-  trackJob(pid, { kind: 'upscale', profileId, itemId: item.id, graph, upscaleInfo: options });
-  ensureWs();
-  return pid;
+async function queuePostUpscale(item, options, profileId, sourceReceipt = null) {
+  const parentOperationId = String(item.finalization?.operationId || '');
+  const receipt = sourceReceipt || createChildReceipt({
+    id: crypto.randomUUID(),
+    parentId: parentOperationId || `gallery:${item.id}`,
+    relation: 'post_upscale',
+    ordinal: 0,
+    profileId,
+    intent: { itemId: item.id, sourceFile: item.file, upscaleInfo: options },
+  });
+  return queueDurableUpscale(item, options, profileId, receipt);
+}
+
+function childReceiptForJob(job) {
+  return Array.isArray(job?.childReceipts) ? job.childReceipts[0] : null;
+}
+
+function persistUpscaleChildReceipt(pid, receipt, patch = {}) {
+  return persistJob(pid, Object.assign({}, patch, { childReceipts: [receipt] }));
+}
+
+async function stageDurableUpscaleInput(job) {
+  const item = db.items.find((entry) => entry.id === job.itemId && entry.profileId === job.profileId);
+  if (!item) {
+    const error = new Error('The source gallery item for this preserved upscale no longer exists.');
+    error.code = 'upscale_source_missing';
+    throw error;
+  }
+  const sourceFile = String(job.sourceAsset?.file || '');
+  const content = await fsp.readFile(path.join(IMAGES, sourceFile));
+  if (content.length !== job.sourceAsset?.bytes || hashAsset(content) !== job.sourceAsset?.sha256) {
+    const error = new Error('The source image changed after this upscale was queued.');
+    error.code = 'upscale_source_changed';
+    throw error;
+  }
+  const uploaded = await uploadToComfy(content, job.sourceAsset.logicalName);
+  if (uploaded !== job.sourceAsset.logicalName) {
+    const error = new Error('ComfyUI renamed the preserved upscale input, so Mix stopped before submitting a stale graph.');
+    error.code = 'upscale_input_renamed';
+    throw error;
+  }
+  let receipt = childReceiptForJob(job);
+  if (receipt?.state === 'planned') receipt = transitionChildReceipt(receipt, 'staging');
+  if (receipt?.state === 'awaiting_recovery') receipt = transitionChildReceipt(receipt, 'staging');
+  if (receipt?.state === 'staging') receipt = transitionChildReceipt(receipt, 'staged');
+  if (receipt) persistUpscaleChildReceipt(job.operationId, receipt, { stagedAt: Date.now() });
+  return uploaded;
+}
+
+async function submitDurableUpscale(job) {
+  const pid = job.operationId;
+  try {
+    await stageDurableUpscaleInput(job);
+    let receipt = childReceiptForJob(job);
+    receipt = beginChildSubmission(receipt, { attemptId: crypto.randomUUID() });
+    persistUpscaleChildReceipt(pid, receipt, {
+      submissionState: 'submitting',
+      submissionAttemptId: receipt.submission.attemptId,
+      submitStartedAt: Date.now(),
+    });
+    const queuedPid = await queuePrompt(job.graph, {
+      profileId: job.profileId,
+      promptId: pid,
+      localState: 'submitting',
+    });
+    if (queuedPid !== pid) {
+      const error = new Error('ComfyUI changed the stable ID for this preserved upscale.');
+      error.code = 'comfy_prompt_id_mismatch';
+      throw error;
+    }
+    receipt = transitionChildReceipt(receipt, 'submitted', {
+      submission: Object.assign({}, receipt.submission, { acknowledgedAt: Date.now() }),
+    });
+    persistUpscaleChildReceipt(pid, receipt, {
+      submissionState: 'submitted',
+      submittedAt: Date.now(),
+      lastReconciledAt: Date.now(),
+      recoveryError: undefined,
+    });
+    ensureWs();
+    return { pid, deferred: false };
+  } catch (error) {
+    const current = childReceiptForJob(job);
+    const retryable = preserveDurableSubmission(error)
+      || ['comfy_connection_failed', 'comfy_submission_unknown'].includes(error?.code);
+    let receipt = current;
+    if (retryable && current && !['awaiting_recovery', 'attention'].includes(current.state)) {
+      receipt = markChildAwaitingRecovery(current, {
+        resumeState: current.state === 'submitting' ? 'submission_unknown' : current.state,
+        reason: String(error.message || error),
+      });
+    } else if (!retryable && current && current.state !== 'attention') {
+      receipt = transitionChildReceipt(current, 'attention', {
+        error: { code: String(error?.code || 'upscale_submission_failed'), message: String(error.message || error) },
+      });
+    }
+    persistUpscaleChildReceipt(pid, receipt, {
+      submissionState: retryable ? 'submission_unknown' : 'attention',
+      recoveryError: retryable ? undefined : {
+        code: String(error?.code || 'upscale_submission_failed'),
+        message: String(error.message || error),
+        attentionRequired: true,
+      },
+    });
+    ensureWs();
+    return { pid, deferred: true };
+  }
+}
+
+async function queueDurableUpscale(item, options, profileId, sourceReceipt = null) {
+  const receipt = sourceReceipt || createChildReceipt({
+    id: crypto.randomUUID(),
+    parentId: `gallery:${item.id}`,
+    relation: 'manual_upscale',
+    ordinal: 0,
+    profileId,
+    intent: { itemId: item.id, sourceFile: item.file, upscaleInfo: options },
+  });
+  if (jobs.has(receipt.id)) return { pid: receipt.id, deferred: true };
+  if (item.upscaleReceipt?.operationId === receipt.id) return { pid: receipt.id, deferred: false, complete: true };
+  const content = await fsp.readFile(path.join(IMAGES, item.file));
+  const logicalName = `ks_upsrc_${receipt.id}.png`;
+  const graph = await buildUpscale(logicalName, options);
+  const stagingReceipt = transitionChildReceipt(receipt, 'staging');
+  const job = {
+    kind: 'upscale',
+    profileId,
+    params: { mode: 'upscale' },
+    graph,
+    itemId: item.id,
+    upscaleInfo: options,
+    sourceAsset: {
+      file: item.file,
+      previousAttachment: item.upscaled || null,
+      previousReceiptId: item.upscaleReceipt?.receiptId || null,
+      logicalName,
+      sha256: hashAsset(content),
+      bytes: content.length,
+    },
+    childReceipts: [stagingReceipt],
+    parentOperationId: receipt.parentId,
+    parentReceiptId: receipt.id,
+    operationId: receipt.id,
+    promptId: receipt.id,
+    submissionState: 'staging',
+  };
+  trackJob(receipt.id, job);
+  await durableGalleryTransaction((database) => {
+    const target = database.items.find((entry) => entry.id === item.id && entry.profileId === profileId);
+    if (!target) throw new Error('The source gallery item disappeared before its upscale could be queued.');
+    target.upscalePending = true;
+    target.upscalePendingOperationId = receipt.id;
+  });
+  return submitDurableUpscale(job);
 }
 
 function ultimateSdUpscaleReadinessError(info) {
@@ -7922,6 +8874,7 @@ async function setupStatusPayload(forceCompatibility = false) {
       canInstallOfficial: process.platform === 'win32',
       install: comfySetupState,
       start: Object.assign({}, launch, comfyStartState, { running: comfyStartRunning }),
+      availability: comfySupervisorState,
     },
   };
 }
@@ -8074,7 +9027,25 @@ async function handleApi(req, res, url) {
     if (String(body.confirmName || '') !== target.name) {
       return json(res, 400, { error: `Deletion needs confirmName: "${target.name}"` });
     }
+    const ownsActiveJob = [...jobs.values()].some((job) => job?.profileId === target.id);
+    const ownsActiveReorder = queueReorderReceipt?.profileId === target.id
+      && queueReorderReceipt.phase !== 'complete';
+    if (ownsActiveJob || ownsActiveReorder) {
+      return json(res, 409, {
+        error: 'This profile still has preserved work. Let it finish or cancel it before deleting the profile.',
+        code: 'profile_has_durable_work',
+      });
+    }
     backupDb('pre-delete');
+    // Uploaded inputs have their own crash-replay journal. Complete those
+    // recoverable moves and catalog checkpoints before mutating the rest of
+    // the profile in memory; each callback flush must contain only a durable
+    // asset tombstone, not a half-finished profile deletion.
+    await serializeMediaDeletion(async () => {
+      for (const asset of db.uploadedAssets.filter((entry) => entry.profileId === target.id)) {
+        await deleteUploadedAssetDurably(asset);
+      }
+    });
     // Content moves to a trash folder instead of being destroyed
     const TRASH = path.join(DATA, 'trash', `${Date.now()}_${target.name.replace(/[^\w]+/g, '_')}`);
     await fsp.mkdir(TRASH, { recursive: true });
@@ -8093,17 +9064,13 @@ async function handleApi(req, res, url) {
     db.loraPresets = db.loraPresets.filter((p) => p.profileId !== target.id);
     db.userPreferences = db.userPreferences.filter((p) => p.profileId !== target.id);
     db.smartRuns = db.smartRuns.filter((run) => run.profileId !== target.id);
-    for (const asset of db.uploadedAssets.filter((entry) => entry.profileId === target.id && !entry.deletedAt)) {
-      const durable = inputAssetPath(INPUTS, asset.name);
-      await fsp.rename(durable, path.join(TRASH, path.basename(durable))).catch(() => { /* noop */ });
-    }
     db.uploadedAssets = db.uploadedAssets.filter((entry) => entry.profileId !== target.id);
     db.elements = db.elements.filter((entry) => entry.profileId !== target.id);
     for (const f of db.faces.filter((x) => x.profileId === target.id)) await toTrash(FACES, f.file);
     db.faces = db.faces.filter((f) => f.profileId !== target.id);
     if (target.avatar) await toTrash(AVATARS, target.avatar);
     db.profiles = db.profiles.filter((p) => p.id !== target.id);
-    saveDb();
+    flushDbNow();
     if (profile && profile.id === target.id) res.setHeader('Set-Cookie', profileCookie('', 0));
     return json(res, 200, { ok: true, profiles: db.profiles.map((p) => publicProfile(p, db)) });
   }
@@ -8557,6 +9524,14 @@ async function handleApi(req, res, url) {
     }
     return serializeMediaDeletion(async () => {
       try {
+        const pendingInputDeletion = (await durableInputDeletionReceiptStore.list())
+          .find((receipt) => receipt.catalogState !== 'committed');
+        if (pendingInputDeletion) {
+          return json(res, 409, {
+            error: 'Mix Studio is still securing an uploaded asset in trash. Try emptying trash again after recovery finishes.',
+            code: 'durable_input_deletion_pending',
+          });
+        }
         const removed = await emptyTrashDirectory(TRASH_ROOT);
         return json(res, 200, { ok: true, removed });
       } catch (error) {
@@ -8878,6 +9853,7 @@ async function handleApi(req, res, url) {
   }
   if (route === '/api/settings' && req.method === 'POST') {
     const body = await readJsonBody(req);
+    const previousComfyUrl = settings.comfyUrl;
     if (typeof body.externalLlmOllamaUrl === 'string' && body.externalLlmOllamaUrl.trim()) {
       try { body.externalLlmOllamaUrl = normalizeOllamaUrl(body.externalLlmOllamaUrl); }
       catch (error) { return json(res, 400, { error: String(error.message || error) }); }
@@ -8940,6 +9916,12 @@ async function handleApi(req, res, url) {
     saveJsonSync(SETTINGS_FILE, settings);
     objectInfoCache = null;
     loraInfoCache = { key: '', at: 0, value: {} };
+    if (settings.comfyUrl !== previousComfyUrl) {
+      resetComfyTransport();
+      ensureComfyAvailability('settings:endpoint-changed')?.catch((error) => {
+        console.warn('[comfy-recovery]', error.code || error.message || error);
+      });
+    }
     return json(res, 200, settingsResponse());
   }
 
@@ -9123,8 +10105,9 @@ async function handleApi(req, res, url) {
   if (route === '/api/input' && req.method === 'GET') {
     const name = String(url.searchParams.get('name') || '');
     if (!name) return json(res, 400, { error: 'name required' });
-    const catalogedAsset = db.uploadedAssets.find((asset) => asset.name === name);
-    if (catalogedAsset && catalogedAsset.profileId !== req.profile.id) {
+    const catalogedAssets = db.uploadedAssets.filter((asset) => asset.name === name);
+    const catalogedAsset = catalogedAssets.find((asset) => asset.profileId === req.profile.id);
+    if (catalogedAssets.length && !catalogedAsset) {
       return json(res, 404, { error: 'Uploaded asset not found' });
     }
     if (catalogedAsset && catalogedAsset.deletedAt) {
@@ -9172,34 +10155,52 @@ async function handleApi(req, res, url) {
     const temporary = path.join(INPUTS, `.upload-${crypto.randomBytes(10).toString('hex')}.tmp`);
     try {
       await receiveInputFile(req, temporary, MAX_INPUT_BYTES);
-      const [comfyName, hasAudio] = await Promise.all([
-        uploadFileToComfy(temporary, name),
-        detectAudioStreamFile(temporary, orig),
-      ]);
-      const durable = inputAssetPath(INPUTS, comfyName);
-      await fsp.unlink(durable).catch(() => {});
-      await fsp.rename(temporary, durable);
-      let asset = null;
-      if (req.headers['x-asset-catalog'] === '1') {
-        const stat = await fsp.stat(durable);
-        asset = {
-          id: uid(),
-          profileId: req.profile.id,
-          name: comfyName,
-          label: uploadLabel,
-          kind: uploadedAssetKind(orig, req.headers['content-type']),
-          size: stat.size,
-          hasAudio: hasAudio === true,
-          createdAt: Date.now(),
-        };
-        db.uploadedAssets.push(asset);
-        saveDb();
+      const hasAudio = await detectAudioStreamFile(temporary, orig);
+      const preserved = await durableInputStager.preserveFile({
+        profileId: req.profile.id,
+        name,
+        filePath: temporary,
+      });
+      const durableBlob = path.join(DURABLE_INPUT_ASSETS, `${preserved.asset.assetId}.bin`);
+      const durableAlias = inputAssetPath(INPUTS, name);
+      try {
+        await fsp.link(durableBlob, durableAlias);
+      } catch (error) {
+        if (error?.code === 'EXDEV') await fsp.copyFile(durableBlob, durableAlias, fs.constants.COPYFILE_EXCL);
+        else if (error?.code !== 'EEXIST') throw error;
       }
-      return json(res, 200, {
-        name: comfyName,
+      await fsp.unlink(temporary).catch(() => {});
+      const asset = {
+        id: uid(),
+        assetId: preserved.asset.assetId,
+        sha256: preserved.asset.sha256,
+        profileId: req.profile.id,
+        name,
+        label: uploadLabel,
+        kind: uploadedAssetKind(orig, req.headers['content-type']),
+        size: preserved.asset.bytes,
+        hasAudio: hasAudio === true,
+        listed: req.headers['x-asset-catalog'] === '1',
+        createdAt: Date.now(),
+      };
+      db.uploadedAssets.push(asset);
+      // The response promises that Mix owns this asset. Commit ownership now,
+      // not on the normal debounce, so an immediate process loss cannot leave
+      // an unowned durable blob that queued work is forbidden to stage.
+      flushDbNow();
+      const staged = await durableInputStager.stageFile({
+        profileId: req.profile.id,
+        assetId: preserved.asset.assetId,
+        name,
+        sha256: preserved.asset.sha256,
+      });
+      return json(res, staged.state === 'staged' ? 200 : 202, {
+        name,
         hasAudio: hasAudio === true,
         durable: true,
-        asset: asset ? publicUploadedAsset(asset) : null,
+        staged: staged.state === 'staged',
+        stagingError: staged.error || null,
+        asset: asset.listed ? publicUploadedAsset(asset) : null,
       });
     } catch (error) {
       await fsp.unlink(temporary).catch(() => {});
@@ -9228,11 +10229,17 @@ async function handleApi(req, res, url) {
 
   if (route === '/api/comfy/start' && req.method === 'POST') {
     if (!isAdmin()) return json(res, 403, { error: 'Only the owner profile can start ComfyUI' });
-    if (dependencyInstallRunning || comfyRestartRunning || comfyStartRunning || comfySetupProcess) {
+    if (dependencyInstallRunning || comfyRestartRunning || comfyStartRunning || comfySetupProcess
+      || getComfyAvailabilitySupervisor().isRunning()) {
       return json(res, 409, { error: 'Wait for the current desktop operation to finish.' });
     }
+    // Claim the launch lane before the first await. This closes the gap where
+    // the health supervisor and a manual click could both discover an offline
+    // endpoint and spawn duplicate ComfyUI processes.
+    comfyStartRunning = true;
     try {
-      await assertDesktopIsIdle();
+      // Starting a stopped ComfyUI is recovery, not a destructive maintenance
+      // operation. Preserved jobs must never prevent their own engine restart.
       const launch = startStatus(RUNTIME);
       const expectedBasePath = String(comfySetupExpectedBasePath
         || (launch.kind === 'desktop' ? launch.basePath : '') || '').trim();
@@ -9244,6 +10251,7 @@ async function handleApi(req, res, url) {
           state: 'complete', phase: 'connected', message: 'ComfyUI was already running. Mix Studio connected automatically.',
           error: null, matches: [],
         });
+        comfyStartRunning = false;
         return json(res, 200, { ok: true, alreadyRunning: true, status: await setupStatusPayload() });
       }
       if (alreadyRunning.ambiguous && !expectedBasePath) {
@@ -9252,10 +10260,13 @@ async function handleApi(req, res, url) {
           state: 'choice', phase: 'choose', message: 'More than one running ComfyUI was found. Choose the one Mix Studio should use.',
           error: null, matches,
         });
+        comfyStartRunning = false;
         return json(res, 200, { ok: false, needsChoice: true, matches, status: await setupStatusPayload() });
       }
-      if (!launch.canStart) return json(res, 409, { error: launch.reason || 'ComfyUI start is not configured for this machine.' });
-      comfyStartRunning = true;
+      if (!launch.canStart) {
+        comfyStartRunning = false;
+        return json(res, 409, { error: launch.reason || 'ComfyUI start is not configured for this machine.' });
+      }
       updateComfyStartState({
         state: 'running',
         phase: 'opening',
@@ -10051,11 +11062,8 @@ async function handleApi(req, res, url) {
         noise: ['off', 'low', 'medium'].includes(body.noise) ? body.noise : 'low',
       };
     }
-    const graph = await buildUpscale(comfyName, opts);
-    const pid = await queuePrompt(graph, { profileId: req.profile.id });
-    trackJob(pid, { kind: 'upscale', profileId: req.profile.id, itemId: item.id, graph, upscaleInfo: opts });
-    ensureWs();
-    return json(res, 200, { jobId: pid });
+    const queued = await queueDurableUpscale(item, opts, req.profile.id);
+    return json(res, 200, { jobId: queued.pid, deferred: queued.deferred || undefined });
   }
 
   if (route === '/api/director/assets' && req.method === 'POST') {
@@ -12114,6 +13122,21 @@ async function handleApi(req, res, url) {
   if (route === '/api/queue/reorder' && req.method === 'POST') {
     const body = await readJsonBody(req);
     const order = Array.isArray(body.order) ? body.order.map((id) => String(id || '')).filter(Boolean) : [];
+    if (queueReorderLoadError) {
+      return json(res, 409, {
+        error: 'A previous queue reorder receipt needs repair before another reorder can start.',
+        code: 'queue_reorder_receipt_corrupt',
+      });
+    }
+    if (queueReorderReceipt && queueReorderReceipt.phase !== 'complete') {
+      const resumed = await resumeQueueReorder();
+      return json(res, resumed.state === 'complete' ? 200 : (resumed.state === 'attention' ? 409 : 202), {
+        ok: resumed.state === 'complete',
+        recovering: resumed.state !== 'complete',
+        code: resumed.code || '',
+        order: queueReorderReceipt.order,
+      });
+    }
     const q = await (await comfyFetch('/queue')).json();
     const pendingIds = (q.queue_pending || []).map((entry) => String(entry && entry[1] || '')).filter(Boolean);
     if (!pendingIds.length) return json(res, 409, { error: 'There are no queued jobs to reorder' });
@@ -12124,54 +13147,57 @@ async function handleApi(req, res, url) {
     }
     for (const pid of order) {
       const job = jobs.get(pid);
-      if (!job || job.profileId !== req.profile.id || !job.graph) {
+      if (!job || job.profileId !== req.profile.id || !job.graph || job.cancelRequested) {
         return json(res, 409, { error: 'Only Mix Studio jobs from this profile can be reordered' });
       }
     }
     try {
       // Staging is fallible. Complete it before deleting anything from ComfyUI
       // so an unavailable Element can never turn reorder into queue loss.
-      for (const pid of order) await stageQueuedElementInputs(jobs.get(pid));
+      for (const pid of order) await stageQueuedInputs(jobs.get(pid));
     } catch (error) {
       return json(res, Number(error?.status) || 502, {
         error: String(error.message || error),
         code: error?.code || 'comfy_input_stage_failed',
       });
     }
-    await comfyFetch('/queue', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ delete: pendingIds }),
-    });
-    const mapping = {};
-    try {
-      for (const oldPid of order) {
-        const job = jobs.get(oldPid);
-        const newPid = await queuePrompt(job.graph, {
-          profileId: job.profileId,
-          elementInputNames: job.elementInputNames,
-          elementInputsStaged: true,
-          workflowContractId: job.workflowContractId,
-        });
-        jobs.delete(oldPid);
-        jobs.set(newPid, Object.assign(job, {
-          enqueuedAt: Date.now(),
-          startedAt: null,
-          requeuedFrom: oldPid,
-        }));
-        mapping[oldPid] = newPid;
-      }
-    } catch (error) {
-      return json(res, 502, { error: `Could not rebuild the queue: ${error.message}` });
+    if (order.some((pid) => !jobs.has(pid) || jobs.get(pid).cancelRequested)) {
+      return json(res, 409, { error: 'The queue changed while its inputs were being prepared. Refresh and try again.' });
     }
-    broadcast('queueReordered', { profileId: req.profile.id });
-    return json(res, 200, { ok: true, mapping });
+    // The complete stable-ID order is durably committed before any remote
+    // cancellation. Every later step is observation-driven and crash-replayable.
+    persistQueueReorderReceipt(createQueueReorderReceipt({
+      operationId: crypto.randomUUID(),
+      profileId: req.profile.id,
+      order,
+    }, { now: Date.now() }));
+    const result = await resumeQueueReorder();
+    if (result.state === 'complete') {
+      return json(res, 200, {
+        ok: true,
+        mapping: Object.fromEntries(order.map((promptId) => [promptId, promptId])),
+      });
+    }
+    return json(res, result.state === 'attention' ? 409 : 202, {
+      ok: false,
+      recovering: result.state === 'waiting',
+      error: result.state === 'attention'
+        ? 'Queue reorder needs attention; no uncertain job will be submitted twice.'
+        : 'Queue reorder was preserved and will resume automatically.',
+      code: result.code || '',
+    });
   }
 
   if (route === '/api/queue/cancel' && req.method === 'POST') {
     const body = await readJsonBody(req);
     const pid = String(body.jobId || '');
     if (!pid) return json(res, 400, { error: 'jobId required' });
+    if (activeQueueReorderIds().has(pid)) {
+      return json(res, 409, {
+        error: 'This job is being safely reordered. Wait for the reorder to finish, then cancel it.',
+        code: 'queue_reorder_active',
+      });
+    }
     const job = jobs.get(pid);
     if (!job || job.profileId !== req.profile.id) {
       return json(res, 404, { error: 'This job is no longer available' });
@@ -12182,9 +13208,9 @@ async function handleApi(req, res, url) {
       cancelRequested: true,
       cancelRequestedAt: Date.now(),
       cancelMessage: 'Cancelled by user',
-      submissionState: ['gen', 'loraHunt'].includes(job.kind) ? 'cancel_requested' : job.submissionState,
+      submissionState: isDurableComfyJob(job) ? 'cancel_requested' : job.submissionState,
     });
-    if (['gen', 'loraHunt'].includes(job.kind)) {
+    if (isDurableComfyJob(job)) {
       const cancellation = await reconcileDurableCancellation(pid, job);
       return json(res, 200, {
         ok: true,
@@ -12203,6 +13229,13 @@ async function handleApi(req, res, url) {
   }
 
   if (route === '/api/queue/reset' && req.method === 'POST') {
+    if (!isAdmin()) return json(res, 403, { error: 'Only the owner profile can reset the shared generation queue.' });
+    if (activeQueueReorderIds().size) {
+      return json(res, 409, {
+        error: 'The queue is being safely reordered. Wait for it to finish before resetting the queue.',
+        code: 'queue_reorder_active',
+      });
+    }
     const protectedFinalizations = [...jobs.entries()]
       .filter(([, job]) => job.finalization || ['output_ready', 'finalizing', 'finalized'].includes(job.submissionState))
       .map(([pid]) => pid);
@@ -12264,7 +13297,7 @@ async function handleApi(req, res, url) {
     view.items = view.items.filter((it) => it.profileId === req.profile.id);
     view.folders = view.folders.filter((f) => f.profileId === req.profile.id);
     const uploadedAssets = db.uploadedAssets
-      .filter((asset) => asset.profileId === req.profile.id && !asset.deletedAt)
+      .filter((asset) => asset.profileId === req.profile.id && !asset.deletedAt && asset.listed !== false)
       .map(publicUploadedAsset);
     const elements = db.elements
       .filter((element) => element.profileId === req.profile.id)
@@ -12339,30 +13372,28 @@ async function handleApi(req, res, url) {
   const uploadedAssetDelete = route.match(/^\/api\/uploaded-assets\/([\w]+)$/);
   if (uploadedAssetDelete && req.method === 'DELETE') {
     const asset = db.uploadedAssets.find((entry) => (
-      entry.id === uploadedAssetDelete[1] && entry.profileId === req.profile.id && !entry.deletedAt
+      entry.id === uploadedAssetDelete[1] && entry.profileId === req.profile.id
     ));
     if (!asset) return json(res, 404, { error: 'Uploaded asset not found' });
-    const usage = uploadedAssetUsage(asset, { items: db.items, jobs: [...jobs.values()], elements: db.elements });
-    if (usage.inUse) {
-      const reasons = [];
-      if (usage.savedGenerations) reasons.push(`${usage.savedGenerations} saved generation${usage.savedGenerations === 1 ? '' : 's'}`);
-      if (usage.activeJobs) reasons.push(`${usage.activeJobs} active job${usage.activeJobs === 1 ? '' : 's'}`);
-      if (usage.elements) reasons.push(`${usage.elements} Element${usage.elements === 1 ? '' : 's'}`);
-      return json(res, 409, {
-        error: `This asset is still used by ${reasons.join(' and ')}. Remove those references before deleting it.`,
-        code: 'asset_in_use',
-        usage,
-      });
+    if (asset.deletedAt) {
+      const receipt = asset.assetId ? await durableInputDeletionReceiptStore.load(asset.assetId) : null;
+      if (!receipt) return json(res, 404, { error: 'Uploaded asset not found' });
+    } else {
+      const usage = uploadedAssetUsage(asset, { items: db.items, jobs: [...jobs.values()], elements: db.elements });
+      if (usage.inUse) {
+        const reasons = [];
+        if (usage.savedGenerations) reasons.push(`${usage.savedGenerations} saved generation${usage.savedGenerations === 1 ? '' : 's'}`);
+        if (usage.activeJobs) reasons.push(`${usage.activeJobs} active job${usage.activeJobs === 1 ? '' : 's'}`);
+        if (usage.elements) reasons.push(`${usage.elements} Element${usage.elements === 1 ? '' : 's'}`);
+        return json(res, 409, {
+          error: `This asset is still used by ${reasons.join(' and ')}. Remove those references before deleting it.`,
+          code: 'asset_in_use',
+          usage,
+        });
+      }
     }
     await serializeMediaDeletion(async () => {
-      const durable = inputAssetPath(INPUTS, asset.name);
-      const trash = path.join(TRASH_ROOT, 'uploaded-assets', asset.profileId);
-      await fsp.mkdir(trash, { recursive: true });
-      await fsp.rename(durable, path.join(trash, `${Date.now()}_${path.basename(durable)}`)).catch((error) => {
-        if (error && error.code !== 'ENOENT') throw error;
-      });
-      asset.deletedAt = Date.now();
-      saveDb();
+      await deleteUploadedAssetDurably(asset);
     });
     return json(res, 200, { ok: true, id: asset.id });
   }
@@ -13194,7 +14225,10 @@ const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, 'http://localhost');
   try {
     if (url.pathname.startsWith('/mcp/')) return await handleSparkMcp(req, res, url);
-    if (url.pathname.startsWith('/api/')) return await handleApi(req, res, url);
+    if (url.pathname.startsWith('/api/')) {
+      await durableInputDeletionRecovery;
+      return await handleApi(req, res, url);
+    }
     if (url.pathname.startsWith('/images/')) {
       const profile = currentProfile(req);
       if (!profile) return json(res, 401, { error: 'Sign in to view generated media', code: 'auth' });
@@ -13344,6 +14378,9 @@ server.listen(PORT, '0.0.0.0', () => {
     console.log(`    Queue: recovering ${recoveredLocalJobs.length} interrupted local job(s)`);
     ensureWs();
   }
+  ensureComfyAvailability('server_boot')?.catch((error) => {
+    console.warn('[comfy-recovery]', error.code || error.message || error);
+  });
   if (typeof WebSocket === 'undefined') {
     console.log('    Note: Node < 22 detected - live progress disabled (polling fallback).');
   }

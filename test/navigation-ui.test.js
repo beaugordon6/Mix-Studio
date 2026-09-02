@@ -273,9 +273,10 @@ test('create and edit image workflows can queue an optional SeedVR2 finish pass'
   assert.match(app, /state\.createUpscaleEnabled = !!it\.postUpscale/);
   assert.match(app, /state\.editUpscaleEnabled = !!it\.postUpscale/);
   assert.match(server, /function normalizePostUpscale\(value\)/);
-  assert.match(server, /async function queuePostUpscale\(item, options, profileId\)/);
+  assert.match(server, /async function queuePostUpscale\(item, options, profileId, sourceReceipt = null\)/);
   assert.match(server, /p\.mode === 'edit' \|\| p\.mode === 't2i' \? normalizePostUpscale/);
-  assert.match(server, /await queuePostUpscale\(item, job\.params\.postUpscale, job\.profileId\)/);
+  assert.match(server, /await (?:queuePostUpscale|ensurePostUpscaleChildren)\(/);
+  assert.match(server, /async function queueDurableUpscale\(item, options, profileId, sourceReceipt = null\)/);
 });
 
 test('each edit model remembers its own selected LoRAs', () => {

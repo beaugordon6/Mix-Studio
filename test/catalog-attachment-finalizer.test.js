@@ -38,13 +38,19 @@ function fixture(t, options = {}) {
   const databaseStore = createAtomicJsonDatabaseStore(dbFile, { initialValue: initialDb });
   const receiptStore = createFileCatalogAttachmentReceiptStore(receiptDirectory);
   const content = Buffer.from('complete replacement upscale bytes');
+  const sourceContent = Buffer.from('source image bytes');
+  fs.mkdirSync(mediaDirectory, { recursive: true });
+  fs.writeFileSync(path.join(mediaDirectory, 'source.png'), sourceContent);
   const request = {
     operationId: OPERATION_ID,
     strategy: 'replace_upscale',
     profileId: 'owner',
     target: {
       itemId: 'item-1',
-      sourceVersion: { file: 'source.png', attachment: oldUpscale },
+      sourceVersion: {
+        file: 'source.png', attachment: oldUpscale,
+        sha256: hashAsset(sourceContent), bytes: sourceContent.length,
+      },
     },
     output: {
       kind: 'image', role: 'upscale', extension: '.png', content,
@@ -83,7 +89,10 @@ test('receipt validation binds target version, output digest, and deterministic 
     operationId: OPERATION_ID,
     strategy: 'replace_upscale',
     profileId: 'owner',
-    target: { itemId: 'item-1', sourceVersion: { file: 'source.png', attachment: null } },
+    target: {
+      itemId: 'item-1',
+      sourceVersion: { file: 'source.png', attachment: null, sha256: hashAsset(content), bytes: content.length },
+    },
     output: { extension: '.png', sha256: hashAsset(content), bytes: content.length },
   });
   assert.equal(validateCatalogAttachmentReceipt(receipt), receipt);
@@ -154,7 +163,7 @@ for (const crashPoint of ['after_asset_commit', 'after_asset_checkpoint', 'after
     assert.equal(db.items[0].upscaled, result.receipt.output.filename);
     assert.equal(db.history.length, 1);
     assert.equal(db.history[0].id, result.receipt.historyId);
-    assert.equal(fs.readdirSync(value.mediaDirectory).filter((name) => !name.startsWith('.')).length, 1);
+    assert.equal(fs.readdirSync(value.mediaDirectory).filter((name) => !name.startsWith('.')).length, 2);
   });
 }
 
@@ -209,6 +218,8 @@ test('a later operation can replace an operation-scoped upscale only from its ex
         file: 'source.png',
         attachment: first.receipt.output.filename,
         receiptId: first.receipt.receiptId,
+        sha256: value.request.target.sourceVersion.sha256,
+        bytes: value.request.target.sourceVersion.bytes,
       },
     },
     output: {
@@ -237,7 +248,11 @@ test('a stale or omitted prior receipt version cannot replace an operation-scope
     operationId: '28dbb8a2-91fb-4487-97fe-cc37b7de16ed',
     target: {
       itemId: 'item-1',
-      sourceVersion: { file: 'source.png', attachment: first.receipt.output.filename },
+      sourceVersion: {
+        file: 'source.png', attachment: first.receipt.output.filename,
+        sha256: value.request.target.sourceVersion.sha256,
+        bytes: value.request.target.sourceVersion.bytes,
+      },
     },
     output: {
       ...value.request.output,
@@ -273,7 +288,7 @@ test('cancellation before publication suppresses every visible effect', async (t
   const value = fixture(t);
   const result = await value.makeFinalizer().finalize({ ...value.request, cancelRequested: true });
   assert.equal(result.status, 'cancelled');
-  assert.equal(fs.existsSync(value.mediaDirectory), false);
+  assert.equal(fs.existsSync(path.join(value.mediaDirectory, attachmentIdentity(OPERATION_ID).filename)), false);
   const db = await database(value);
   assert.equal(db.items[0].upscaled, value.oldUpscale);
   assert.equal(db.history.length, 0);
@@ -347,8 +362,23 @@ test('changed content for the same operation becomes attention before publicatio
   });
   assert.equal(result.status, 'attention');
   assert.equal(result.conflict.type, 'catalog_attachment_content_mismatch');
-  assert.equal(fs.existsSync(value.mediaDirectory), false);
+  assert.equal(fs.existsSync(path.join(value.mediaDirectory, attachmentIdentity(OPERATION_ID).filename)), false);
   assert.equal((await database(value)).items[0].upscaled, value.oldUpscale);
+});
+
+test('source bytes changing after submission stop the attachment before catalog commit', async (t) => {
+  const value = fixture(t);
+  const stop = new Error('stop after asset checkpoint');
+  await assert.rejects(value.makeFinalizer(async (point) => {
+    if (point === 'after_asset_checkpoint') throw stop;
+  }).finalize(value.request), stop);
+  fs.writeFileSync(path.join(value.mediaDirectory, 'source.png'), 'changed source bytes');
+  const result = await value.makeFinalizer().finalize(value.request);
+  assert.equal(result.status, 'attention');
+  assert.equal(result.conflict.type, 'source_asset_identity_mismatch');
+  const db = await database(value);
+  assert.equal(db.items[0].upscaled, value.oldUpscale);
+  assert.equal(db.history.length, 0);
 });
 
 test('reusing an operation id for a different request returns attention without changing the saved receipt', async (t) => {

@@ -38,6 +38,7 @@ test('every server queue submission carries its profile id into centralized outp
   const calls = [...server.matchAll(/queuePrompt\(([^\n]+)\)/g)]
     .map((match) => match[0])
     .filter((call) => !call.startsWith('queuePrompt(graph, options'));
-  assert.ok(calls.length >= 15);
+  assert.ok(calls.length > 0);
   calls.forEach((call) => assert.match(call, /profileId/, call));
+  assert.match(server, /queuePrompt\(job\.graph, \{[\s\S]{0,320}profileId: job\.profileId/);
 });
