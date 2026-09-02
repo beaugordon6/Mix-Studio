@@ -45,10 +45,10 @@ Allowed statuses are `Ready`, `Claimed`, `Blocked`, and `Completed`. Follow the 
 
 ### MIX-013 — Reliability spine and blocking-error SLO
 
-- Status: Ready
+- Status: Claimed
 - Priority: High
-- Claimed by: —
-- Claimed at: —
+- Claimed by: `codex/runpod-h3-worker` — reliability spine implementation
+- Claimed at: 2026-09-02T19:54:57Z
 - Completed at: —
 - Summary: Reduce Mix Studio to no more than one user-blocking incident per week by making runtime identity, workflow readiness, error recovery, and release verification measurable and consistent.
 - Requirements:
@@ -70,8 +70,8 @@ Allowed statuses are `Ready`, `Claimed`, `Blocked`, and `Completed`. Follow the 
 - Dependencies:
   - Finish the remaining workflow families and idempotency guarantees in MIX-006.
   - Preserve the canonical source-install repair in MIX-012 and repository coordination protocol in MIX-003.
-- Verification: Not started.
-- Notes: Created from the 2026-09-02 cross-task incident review. Recurring clusters were installation/port/input-namespace drift, pre-submit durability gaps, dependency success checked against the wrong installation, toast-only failures, shared-worktree deployment contamination, cloud capacity ambiguity, and insufficient behavioral fault tests. Provider capacity counts as blocking when Mix allows an attempt that cannot run.
+- Verification: First reliability-spine milestone verified 2026-09-02: focused runtime identity, workflow contract, offline queue, Element staging, dependency, compatibility, cancellation, and recovery tests passed 112/112. A read-only live attestation identified canonical ComfyUI 0.34.0 as the configured source/models/input installation, and the production Character Element graph passed its versioned contract against the live `/object_info` without submitting work. The exact staged patch passed `node --check server.js`, `node --check public/app.js`, and the clean full `node --test` suite (1,306 passed, 0 failed, 1 skipped) in an isolated checkout.
+- Notes: Created from the 2026-09-02 cross-task incident review. Recurring clusters were installation/port/input-namespace drift, pre-submit durability gaps, dependency success checked against the wrong installation, toast-only failures, shared-worktree deployment contamination, cloud capacity ambiguity, and insufficient behavioral fault tests. Provider capacity counts as blocking when Mix allows an attempt that cannot run. Milestone 1 adds stable install and per-process instance fingerprints, rejects a foreign source/input/models runtime before every Comfy write, keys the node-schema cache to the live instance, adds exact Character and Location/Prop Element contracts, includes shared CLIP/VAE readiness and Krea core gating, and keeps all profile-owned durable jobs visible when Comfy is offline. The next P0 is the stable pre-submit operation ID and lifecycle work in MIX-006; Comfy accepts a caller-supplied UUID but does not deduplicate duplicate submissions, so reconciliation must precede every retry.
 
 ### MIX-001 — Automatic Krea 2 face repair
 

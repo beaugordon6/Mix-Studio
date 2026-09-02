@@ -77,6 +77,8 @@ const {
 const { discoverModels } = require('./installer/model-discovery');
 const { restartComfy, restartStatus, startComfy, startStatus } = require('./lib/comfy-restart');
 const { discoverComfyEndpoints, probeComfyUrl } = require('./lib/comfy-discovery');
+const { assertVerifiedComfyRuntime, attestComfyEndpoint } = require('./lib/comfy-runtime-identity');
+const { assertWorkflowCapability } = require('./lib/workflow-capabilities');
 const {
   normalizeGenerationDefaults,
   normalizeAssetPickerPreferences,
@@ -99,6 +101,7 @@ const {
 } = require('./lib/private-gallery');
 const { comfyResetRequests } = require('./lib/comfy-reset');
 const { stageElementInputs } = require('./lib/comfy-input-stager');
+const { attentionQueueRows, offlineQueueSnapshot, preservedQueueRows } = require('./lib/queue-recovery-view');
 const {
   assessQueueHealth,
   parseNvidiaSmiCsv,
@@ -1050,6 +1053,7 @@ let setupHardwareSnapshot = null;
 let setupHardwareAt = 0;
 let comfyCompatibilitySnapshot = null;
 let comfyCompatibilityAt = 0;
+let objectInfoRuntimeInstanceId = '';
 let comfySetupProcess = null;
 let comfySetupCancelRequested = false;
 let comfySetupExpectedBasePath = '';
@@ -1438,6 +1442,7 @@ async function requeueMissingDurableJob(pid, job) {
     const nextPid = await queuePrompt(job.graph, {
       profileId: job.profileId,
       elementInputNames: job.elementInputNames,
+      workflowContractId: job.workflowContractId,
     });
     jobs.delete(pid);
     const replacement = Object.assign(job, {
@@ -1553,7 +1558,25 @@ async function queueHealth(running, pending) {
   }, assessed);
 }
 
+async function verifyConfiguredComfyRuntime() {
+  const attestation = await attestComfyEndpoint(RUNTIME, settings.comfyUrl, {
+    platform: process.platform,
+    timeoutMs: 4000,
+  });
+  assertVerifiedComfyRuntime(attestation);
+  if (objectInfoRuntimeInstanceId && objectInfoRuntimeInstanceId !== attestation.observed.instanceId) {
+    objectInfoCache = null;
+    objectInfoAt = 0;
+    comfyCompatibilitySnapshot = null;
+    comfyCompatibilityAt = 0;
+  }
+  objectInfoRuntimeInstanceId = attestation.observed.instanceId;
+  return attestation;
+}
+
 async function comfyFetch(p, opts) {
+  const method = String(opts?.method || 'GET').toUpperCase();
+  if (!['GET', 'HEAD'].includes(method)) await verifyConfiguredComfyRuntime();
   const url = settings.comfyUrl.replace(/\/$/, '') + p;
   let res;
   try {
@@ -1561,7 +1584,7 @@ async function comfyFetch(p, opts) {
   } catch (error) {
     const detail = String(error?.cause?.message || error?.message || error || 'connection failed');
     const wrapped = new Error(
-      `Could not reach ComfyUI for ${String(opts?.method || 'GET').toUpperCase()} ${p}: ${detail}. `
+      `Could not reach ComfyUI for ${method} ${p}: ${detail}. `
       + `Check that ComfyUI is running at ${settings.comfyUrl}.`
     );
     wrapped.code = 'comfy_connection_failed';
@@ -1727,6 +1750,9 @@ function configuredModelsStatus(info) {
       label: 'Visual Elements',
       unet: diffusionModelStatus(info, settings.krea2ElementUnet),
       identityLora: modelStatus(info, 'LoraLoaderModelOnly', 'lora_name', settings.krea2ElementLora, loraList),
+      clip: modelStatus(info, 'CLIPLoader', 'clip_name', settings.clip),
+      clipType: { name: settings.clipType, ok: krea2Core.supported === true },
+      vae: modelStatus(info, 'VAELoader', 'vae_name', settings.vae),
     },
     klein4: {
       label: 'Flux Klein 4B',
@@ -2217,7 +2243,10 @@ async function uploadFileToComfy(file, filename) {
       return (result.subfolder ? result.subfolder + '/' : '') + result.name;
     } catch (error) {
       if (error?.code !== 'comfy_connection_failed' || attempt > 0) {
-        throw new Error(`Could not upload ${filename} to ComfyUI: ${String(error.message || error)}`, { cause: error });
+        const wrapped = new Error(`Could not upload ${filename} to ComfyUI: ${String(error.message || error)}`, { cause: error });
+        wrapped.code = error?.code || 'comfy_input_upload_failed';
+        wrapped.status = Number(error?.status) || 502;
+        throw wrapped;
       }
       resetComfyTransport();
       await pause(750);
@@ -2227,6 +2256,10 @@ async function uploadFileToComfy(file, filename) {
 }
 
 async function queuePrompt(graph, options = {}) {
+  await verifyConfiguredComfyRuntime();
+  if (options.workflowContractId) {
+    assertWorkflowCapability(options.workflowContractId, graph, await getObjectInfo());
+  }
   if (options.elementInputsStaged !== true
     && Array.isArray(options.elementInputNames) && options.elementInputNames.length) {
     await stageElementInputs({
@@ -5091,10 +5124,14 @@ async function buildGenerationGraph(p, refNames) {
 
 async function queueGenerationJob(p, profileId, refNames, refinedPrompt = null) {
   const graph = await buildGenerationGraph(p, refNames);
+  const workflowContractId = p.elementIdentityMode
+    ? 'create.krea2.element-character@1'
+    : (p.elementReferenceMode ? 'create.krea2.element-remix@1' : '');
   const elementInputNames = (p.elementsUsed || []).flatMap((element) => element.assetNames || []);
-  const pid = await queuePrompt(graph, { profileId, elementInputNames });
+  const pid = await queuePrompt(graph, { profileId, elementInputNames, workflowContractId });
   trackJob(pid, {
-    kind: 'gen', profileId, params: p, graph, refImageNames: refNames, elementInputNames, refinedPrompt,
+    kind: 'gen', profileId, params: p, graph, refImageNames: refNames,
+    elementInputNames, workflowContractId, refinedPrompt,
   });
   ensureWs();
   return { pid, graph };
@@ -5113,11 +5150,14 @@ async function queueStrengthHuntJob(p, profileId, refNames, refinedPrompt = null
     }), refNames));
   }
   const graph = mergeStrengthHuntGraphs(graphs);
+  const workflowContractId = p.elementIdentityMode
+    ? 'create.krea2.element-character@1'
+    : (p.elementReferenceMode ? 'create.krea2.element-remix@1' : '');
   const elementInputNames = (p.elementsUsed || []).flatMap((element) => element.assetNames || []);
-  const pid = await queuePrompt(graph, { profileId, elementInputNames });
+  const pid = await queuePrompt(graph, { profileId, elementInputNames, workflowContractId });
   trackJob(pid, {
     kind: 'loraHunt', profileId, params: Object.assign({}, p, { batch: 1, postUpscale: undefined }),
-    graph, refImageNames: refNames, elementInputNames, refinedPrompt, huntPlan,
+    graph, refImageNames: refNames, elementInputNames, workflowContractId, refinedPrompt, huntPlan,
   });
   ensureWs();
   return { pid, graph, huntPlan };
@@ -6913,7 +6953,7 @@ const REQUIRED_CLASSES = {
 };
 
 const KREA2_DEPENDENCY_COMPONENTS = new Set([
-  'image', 'krea2raw', 'regional', 'krea2ref', 'krea2remix', 'krea2outpaint', 'krea2depth', 'krea2style',
+  'image', 'krea2raw', 'regional', 'krea2ref', 'krea2remix', 'krea2outpaint', 'krea2depth', 'krea2style', 'elements',
 ]);
 const H3_DEPENDENCY_COMPONENTS = new Set(['h3', 'h3r2v', 'h3turbo', 'h3turbor2v', 'h3context', 'h3sage', 'h3sla', 'h3dyntime']);
 
@@ -7069,7 +7109,9 @@ async function setupStatusPayload(forceCompatibility = false) {
   let connected = false;
   let connectionError = '';
   let info = null;
+  let runtimeIdentity = null;
   try {
+    runtimeIdentity = await verifyConfiguredComfyRuntime();
     info = await getObjectInfo(forceCompatibility);
     connected = true;
   } catch (error) {
@@ -7146,6 +7188,13 @@ async function setupStatusPayload(forceCompatibility = false) {
     comfy: {
       connected,
       connectionError,
+      runtimeIdentity: runtimeIdentity ? {
+        status: runtimeIdentity.match.status,
+        code: runtimeIdentity.match.code,
+        installId: runtimeIdentity.expected.installId.slice(0, 16),
+        instanceId: runtimeIdentity.observed.instanceId.slice(0, 16),
+        mismatches: runtimeIdentity.match.mismatches,
+      } : null,
       version: compatibility.version,
       krea2: krea2Core,
       minimaxH3: h3Core,
@@ -9062,7 +9111,7 @@ async function handleApi(req, res, url) {
           if (missingModels.length) {
             return json(res, 409, {
               error: `Elements need their Krea 2 identity models installed: ${missingModels.map((status) => status.name).join(', ')}`,
-              code: 'element_reference_nodes_missing',
+              code: 'element_reference_models_missing',
             });
           }
         }
@@ -11202,6 +11251,20 @@ async function handleApi(req, res, url) {
       updatedAt: dependencyInstallState.updatedAt || queueNow,
       canCancel: isAdmin(),
     }] : [];
+    const attentionRows = attentionQueueRows(jobs, {
+      profileId: req.profile.id,
+      now: queueNow,
+      thumbnailFor: jobThumbnail,
+      labelFor: jobLabel,
+      durationFor: jobDurationMs,
+    });
+    const preservedRows = preservedQueueRows(jobs, {
+      profileId: req.profile.id,
+      now: queueNow,
+      thumbnailFor: jobThumbnail,
+      labelFor: jobLabel,
+      durationFor: jobDurationMs,
+    });
     try {
       const q = await (await comfyFetch('/queue')).json();
       // Other profiles' jobs stay visible (shared GPU) but get redacted labels
@@ -11244,15 +11307,6 @@ async function handleApi(req, res, url) {
         preparing: true,
         cancellable: false,
       })));
-      const attentionRows = [...jobs.entries()]
-        .filter(([, job]) => job.profileId === req.profile.id && job.recoveryError?.attentionRequired)
-        .map(([jobId, job]) => ({
-          jobId, kind: job.kind, itemId: job.itemId || null, thumbnail: jobThumbnail(job),
-          label: jobLabel(job), queuedAt: job.enqueuedAt || queueNow, startedAt: null,
-          elapsedMs: jobDurationMs(job, queueNow), durationMs: jobDurationMs(job, queueNow),
-          owned: true, cancellable: true, reorderable: false, attentionRequired: true,
-          error: job.recoveryError.message, code: job.recoveryError.code,
-        }));
       const upcoming = attentionRows.concat(db.smartRuns
         .filter((run) => run.profileId === req.profile.id && ['ready', 'running', 'queueing', 'review'].includes(run.status))
         .flatMap((run) => (run.steps || []).filter((step) => step.status === 'pending').map((step) => ({
@@ -11300,7 +11354,9 @@ async function handleApi(req, res, url) {
         }),
       });
     } catch (e) {
-      return json(res, 200, { ok: false, error: String(e.message || e), preparing: [], running: [], pending: [], upcoming: [], finalizing: [], downloads: activeDownloads });
+      return json(res, 200, offlineQueueSnapshot({
+        preservedRows, activeDownloads, error: e,
+      }));
     }
   }
 
@@ -11386,6 +11442,7 @@ async function handleApi(req, res, url) {
           profileId: job.profileId,
           elementInputNames: job.elementInputNames,
           elementInputsStaged: true,
+          workflowContractId: job.workflowContractId,
         });
         jobs.delete(oldPid);
         jobs.set(newPid, Object.assign(job, {

@@ -22533,9 +22533,9 @@ function renderQueue(q) {
     st.dataset.jobId = j.jobId;
     const pct = state.queueProgress[j.jobId];
     const elapsed = j.elapsedMs != null ? formatDuration(j.elapsedMs) : '';
-    st.textContent = j.attentionRequired ? 'Attention' : (j.preparing ? 'Enhancing' : (j.finalizing ? 'Finalizing'
+    st.textContent = j.attentionRequired ? 'Attention' : (j.waitingForComfy ? 'Waiting for ComfyUI' : (j.preparing ? 'Enhancing' : (j.finalizing ? 'Finalizing'
       : (j.upcoming ? (j.waitingForReview ? 'Review' : 'Upcoming')
-        : (j.run ? (pct != null ? pct + '%' : 'Running') : 'Queued'))));
+        : (j.run ? (pct != null ? pct + '%' : 'Running') : 'Queued')))));
     const lb = document.createElement('span');
     lb.className = 'q-label';
     const queueLabel = j.attentionRequired && j.error ? `${j.label} — ${j.error}` : j.label;

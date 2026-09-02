@@ -14,7 +14,8 @@ const style = fs.readFileSync(path.join(__dirname, '..', 'public', 'style.css'),
 
 test('generation submission stages Element inputs before posting a prompt', () => {
   assert.match(server, /async function queuePrompt\(graph, options = \{\}\) \{[\s\S]*?await stageElementInputs\(\{[\s\S]*?uploadFile: uploadFileToComfy,[\s\S]*?comfyFetch\('\/prompt'/);
-  assert.match(server, /queueGenerationJob[\s\S]*?const elementInputNames = \(p\.elementsUsed \|\| \[\]\)\.flatMap[\s\S]*?queuePrompt\(graph, \{ profileId, elementInputNames \}\)/);
+  assert.match(server, /queueGenerationJob[\s\S]*?const elementInputNames = \(p\.elementsUsed \|\| \[\]\)\.flatMap[\s\S]*?queuePrompt\(graph, \{ profileId, elementInputNames, workflowContractId \}\)/);
+  assert.match(server, /queuePrompt\(graph, options = \{\}\)[\s\S]*?assertWorkflowCapability\(options\.workflowContractId, graph, await getObjectInfo\(\)\)/);
 });
 
 test('Element input manifests survive restart recovery and queue reorder', () => {
@@ -25,7 +26,8 @@ test('Element input manifests survive restart recovery and queue reorder', () =>
   assert.match(reorder, /elementInputsStaged: true/);
   assert.match(server, /elementNeedsAttention[\s\S]*?recoveryError[\s\S]*?attentionRequired: true/);
   assert.match(server, /requeueMissingDurableJob[\s\S]*?recoveryError\?\.attentionRequired\) return false/);
-  assert.match(server, /const attentionRows = \[\.\.\.jobs\.entries\(\)\][\s\S]*?attentionRequired: true[\s\S]*?error: job\.recoveryError\.message/);
+  assert.match(server, /const attentionRows = attentionQueueRows\(jobs,[\s\S]*?profileId: req\.profile\.id/);
+  assert.match(server, /const upcoming = attentionRows\.concat\(db\.smartRuns/);
   assert.match(app, /j\.attentionRequired \? 'Attention'/);
   assert.match(app, /j\.attentionRequired && j\.error \? `\$\{j\.label\} — \$\{j\.error\}`/);
   assert.match(style, /\.q-state\.attention[\s\S]*?\.queue-row\.attention \.q-label/);
