@@ -348,6 +348,7 @@ const {
 const {
   buildKrea2ModelLoader,
   effectiveKrea2Variant,
+  isManagedKrea2TurboModel,
   krea2VariantSettings,
   normalizeKrea2Variant,
   recommendedKrea2Variant,
@@ -1872,6 +1873,12 @@ function dependencyReadinessDiagnostics(componentIds, missing, models, capabilit
     .filter((check) => check?.ok === false && check.name)
     .map((check) => String(check.name));
   if (diagnostics.has('image')) diagnostics.get('image').missingModels.push(...krea2CoreNames);
+  if (diagnostics.has('image') && krea2.turbo?.ok === false && !isManagedKrea2TurboModel(krea2.turbo.name)) {
+    const diagnostic = diagnostics.get('image');
+    diagnostic.installable = false;
+    diagnostic.blockedBy = 'configured-model';
+    diagnostic.reasons.push(`The configured Krea 2 model is not registered by ComfyUI: ${krea2.turbo.name}. Restore that file in the active ComfyUI models folder or reconnect Mix Studio to the ComfyUI instance that contains it.`);
+  }
   if (diagnostics.has('krea2raw') && krea2.raw?.ok === false && krea2.raw.name) {
     diagnostics.get('krea2raw').missingModels.push(String(krea2.raw.name));
   }
@@ -6759,7 +6766,7 @@ function dependencyComponentInfo(id, fit = null) {
   };
 }
 
-function setupDependencyComponentInfo(id, fit, krea2Core, h3Core, ltx25Core = null, wanAnimate2Core = null, sageAttention = null, slaAttention = null) {
+function setupDependencyComponentInfo(id, fit, krea2Core, h3Core, ltx25Core = null, wanAnimate2Core = null, sageAttention = null, slaAttention = null, customKrea2ModelMissing = false) {
   const component = dependencyComponentInfo(id, fit);
   if (fit?.blocked) {
     component.installable = false;
@@ -6770,6 +6777,11 @@ function setupDependencyComponentInfo(id, fit, krea2Core, h3Core, ltx25Core = nu
     component.installable = false;
     component.blockedBy = 'comfy-core';
     component.installReason = krea2ClipCompatibilityError(krea2Core);
+  }
+  if (id === 'image' && customKrea2ModelMissing) {
+    component.installable = false;
+    component.blockedBy = 'configured-model';
+    component.installReason = `The configured Krea 2 model is not registered by ComfyUI: ${settings.unet}. Restore that file in the active ComfyUI models folder or reconnect Mix Studio to the ComfyUI instance that contains it.`;
   }
   if (h3Core && h3Core.supported !== true && H3_DEPENDENCY_COMPONENTS.has(id)) {
     component.installable = false;
@@ -6904,6 +6916,9 @@ async function setupStatusPayload(forceCompatibility = false) {
   const h3Core = minimaxH3Compatibility(connected ? info : null, compatibility.version);
   const ltx25Core = ltx25Compatibility(connected ? info : null, compatibility.version);
   const wanAnimate2Core = connected ? wanAnimate2CoreCompatibility(info, compatibility.version) : null;
+  const customKrea2ModelMissing = connected
+    && !isManagedKrea2TurboModel(settings.unet)
+    && diffusionModelStatus(info, settings.unet).ok === false;
   const sageRuntime = await probeSageAttention(RUNTIME, {
     status: detected,
     force: forceCompatibility,
@@ -6958,6 +6973,7 @@ async function setupStatusPayload(forceCompatibility = false) {
       wanAnimate2Core,
       sageAttention,
       slaAttention,
+      customKrea2ModelMissing,
     )),
     comfy: {
       connected,
@@ -8016,6 +8032,8 @@ async function handleApi(req, res, url) {
       adoptDeviceCompatibleModelSettings(hardwareProfile);
       const hardwareGuidance = componentHardwareGuidance(SETUP_FEATURE_MANIFEST, hardwareInfoValue);
       const models = configuredModelsStatus(info);
+      const customKrea2ModelMissing = models.krea2?.turbo?.ok === false
+        && !isManagedKrea2TurboModel(models.krea2.turbo.name);
       const installStatus = sam3InstallStatus(RUNTIME);
       const compatibility = await getComfyCompatibility(url.searchParams.has('refresh'));
       const krea2Core = krea2ClipCompatibility(info, compatibility.version);
@@ -8113,6 +8131,7 @@ async function handleApi(req, res, url) {
             wanAnimate2Core,
             sageAttention,
             slaAttention,
+            customKrea2ModelMissing,
           )),
           missingComponents,
           diagnostics: {
@@ -8409,6 +8428,19 @@ async function handleApi(req, res, url) {
     const modelVariants = { krea2: krea2Variant };
     const components = [...new Set(requested.filter((id) => Object.prototype.hasOwnProperty.call(DEPENDENCY_COMPONENTS, id)))];
     if (!components.length) return json(res, 400, { error: 'Choose at least one missing model or node group to install.' });
+    if (components.includes('image') && !isManagedKrea2TurboModel(settings.unet)) {
+      let configuredModelMissing = false;
+      try {
+        configuredModelMissing = diffusionModelStatus(await getObjectInfo(true), settings.unet).ok === false;
+      } catch { /* A stopped ComfyUI is handled by the normal connection flow. */ }
+      if (configuredModelMissing) {
+        return json(res, 409, {
+          error: `The configured Krea 2 model is not registered by ComfyUI: ${settings.unet}. Mix Studio will not replace a custom model with a stock checkpoint. Restore the configured file or reconnect the correct ComfyUI instance.`,
+          code: 'configured_model_unavailable',
+          model: settings.unet,
+        });
+      }
+    }
     const hardwareProfile = setupHardwareProfile(await getSetupHardwareInfo());
     adoptDeviceCompatibleModelSettings(hardwareProfile);
     const hardwareBlocked = components
