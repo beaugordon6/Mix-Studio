@@ -327,6 +327,9 @@ const {
 } = require('./lib/deleted-media');
 const { applyProfileOutputPrefix, profileOutputFolder } = require('./lib/output-prefix');
 const { createJobJournal } = require('./lib/job-journal');
+const { createGalleryFinalizationManifest, hashAsset } = require('./lib/gallery-finalization');
+const { atomicWriteFile, createGalleryFinalizationAdapter } = require('./lib/gallery-finalization-adapter');
+const { assertCompleteGeneratedImage } = require('./lib/generated-output-validation');
 const { expandGalleryGroupSelection } = require('./lib/gallery-grouping');
 const { updateGalleryGroupName } = require('./lib/gallery-group-names');
 const {
@@ -442,6 +445,7 @@ const IMAGES = path.join(DATA, 'images');
 const VIDEOS = path.join(DATA, 'videos');
 const VIDEO_PREVIEWS = path.join(DATA, 'video-previews');
 const INPUTS = path.join(DATA, 'inputs');
+const FINALIZATION_STAGING = path.join(DATA, 'finalization-staging');
 const TRASH_ROOT = path.join(DATA, 'trash');
 const PROMPT_PACKS = path.join(DATA, 'addons', 'prompt-packs');
 const PORT = Number(process.env.PORT || 3300);
@@ -451,6 +455,7 @@ fs.mkdirSync(IMAGES, { recursive: true });
 fs.mkdirSync(VIDEOS, { recursive: true });
 fs.mkdirSync(VIDEO_PREVIEWS, { recursive: true });
 fs.mkdirSync(INPUTS, { recursive: true });
+fs.mkdirSync(FINALIZATION_STAGING, { recursive: true });
 fs.mkdirSync(TRASH_ROOT, { recursive: true });
 fs.mkdirSync(PROMPT_PACKS, { recursive: true });
 const FACES = path.join(DATA, 'faces');
@@ -632,6 +637,35 @@ function saveJsonSync(file, obj) {
   fs.renameSync(tmp, file);
 }
 
+function saveJsonDurablySync(file, obj) {
+  const directory = path.dirname(file);
+  const tmp = path.join(
+    directory,
+    `.${path.basename(file)}.${process.pid}.${crypto.randomBytes(6).toString('hex')}.tmp`,
+  );
+  let descriptor;
+  try {
+    descriptor = fs.openSync(tmp, 'wx', 0o600);
+    fs.writeFileSync(descriptor, JSON.stringify(obj, null, 2));
+    fs.fsyncSync(descriptor);
+    fs.closeSync(descriptor);
+    descriptor = null;
+    fs.renameSync(tmp, file);
+    try {
+      const directoryDescriptor = fs.openSync(directory, 'r');
+      try { fs.fsyncSync(directoryDescriptor); } finally { fs.closeSync(directoryDescriptor); }
+    } catch (error) {
+      if (!['EACCES', 'EINVAL', 'EISDIR', 'ENOTSUP', 'EPERM'].includes(error?.code)) throw error;
+    }
+  } catch (error) {
+    if (descriptor != null) {
+      try { fs.closeSync(descriptor); } catch { /* best effort */ }
+    }
+    try { fs.unlinkSync(tmp); } catch { /* best effort */ }
+    throw error;
+  }
+}
+
 function normalizeSettings(s) {
   s.settingsSchemaVersion = SETTINGS_SCHEMA_VERSION;
   normalizeSeedVr2Defaults(s);
@@ -777,10 +811,32 @@ let db = loadJson(DB_FILE, { folders: [], items: [] });
 let dbSaveTimer = null;
 let dbRevision = 1;
 let mediaDeletionQueue = Promise.resolve();
+let durableGalleryMutationQueue = Promise.resolve();
 function saveDb() {
   dbRevision += 1;
   clearTimeout(dbSaveTimer);
   dbSaveTimer = setTimeout(() => saveJsonSync(DB_FILE, db), 150);
+}
+function flushDbNow() {
+  dbRevision += 1;
+  clearTimeout(dbSaveTimer);
+  dbSaveTimer = null;
+  saveJsonDurablySync(DB_FILE, db);
+}
+
+function durableGalleryTransaction(mutator) {
+  const run = durableGalleryMutationQueue.then(() => {
+    const result = mutator(db);
+    if (result && typeof result.then === 'function') {
+      const error = new Error('Durable gallery database mutations must be synchronous.');
+      error.code = 'gallery_finalization_async_database_mutation';
+      throw error;
+    }
+    flushDbNow();
+    return result;
+  });
+  durableGalleryMutationQueue = run.then(() => undefined, () => undefined);
+  return run;
 }
 function uid() { return crypto.randomBytes(8).toString('hex'); }
 
@@ -1044,6 +1100,32 @@ class DurableJobMap extends Map {
 }
 const recoveredLocalJobs = localJobJournal.entries();
 const jobs = new DurableJobMap(recoveredLocalJobs); // promptId -> job
+const durableGalleryManifestStore = {
+  async load(operationId) {
+    const manifest = jobs.get(String(operationId))?.finalization;
+    return manifest ? JSON.parse(JSON.stringify(manifest)) : null;
+  },
+  async save(manifest) {
+    const pid = String(manifest?.operationId || '');
+    const job = jobs.get(pid);
+    if (!job) {
+      const error = new Error(`Durable generation ${pid} disappeared during gallery finalization.`);
+      error.code = 'gallery_finalization_job_missing';
+      throw error;
+    }
+    persistJob(pid, {
+      finalization: manifest,
+      submissionState: manifest.completed ? 'finalized'
+        : (manifest.phase === 'attention' ? 'attention' : 'finalizing'),
+    });
+  },
+};
+const durableGalleryFinalizer = createGalleryFinalizationAdapter({
+  mediaDirectory: IMAGES,
+  manifestStore: durableGalleryManifestStore,
+  databaseStore: { transaction: durableGalleryTransaction },
+  historyLimit: 50,
+});
 const externalPromptPreflights = new Map(); // synthetic id -> external prompt enhancement
 const queueHealthState = { lowGpuSince: null };
 let dependencyInstallRunning = false;
@@ -1438,6 +1520,7 @@ function jobDurationMs(job, now = Date.now()) {
 
 async function requeueMissingDurableJob(pid, job) {
   if (!job || job.requeueing || !['gen', 'loraHunt'].includes(job.kind) || !job.graph) return false;
+  if (job.finalization || ['output_ready', 'finalizing', 'finalized'].includes(job.submissionState)) return false;
   if (job.recoveryError?.attentionRequired) return false;
   job.requeueing = true;
   job.recoveryAttempts = Math.max(0, Number(job.recoveryAttempts) || 0) + 1;
@@ -2493,7 +2576,7 @@ function handleWsMessage(msg) {
       if (job?.cancelRequested && ['gen', 'loraHunt'].includes(job.kind)) {
         reconcileDurableCancellation(pid, job).catch(() => { /* polling retains and retries the tombstone */ });
       } else {
-        completeJob(pid).catch((e) => failJob(pid, e.message));
+        completeJob(pid).catch((error) => handleCompletionFailure(pid, error));
       }
     }
     else broadcast('status', {
@@ -2742,6 +2825,11 @@ async function downloadOutput(entry) {
   return Buffer.from(await (await comfyFetch(
     `/view?filename=${encodeURIComponent(entry.filename)}&subfolder=${encodeURIComponent(entry.subfolder || '')}&type=output`
   )).arrayBuffer());
+}
+
+async function downloadImageOutput(entry) {
+  const buffer = await downloadOutput(entry);
+  return assertCompleteGeneratedImage(entry?.filename, buffer);
 }
 
 function strengthHuntOutputIndex(entry) {
@@ -2999,9 +3087,194 @@ async function queueNextVideoChunk(job) {
   return nextPid;
 }
 
+function isCanonicalOperationId(value) {
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
+    .test(String(value || '').trim());
+}
+
+function durableGenerationFinalizationEligible(pid, job) {
+  return job?.kind === 'gen'
+    && isCanonicalOperationId(job.operationId || pid)
+    && String(job.operationId || pid) === String(pid)
+    && !job.params?.postUpscale
+    && !job.params?.editSequence
+    && !job.smartRunId;
+}
+
+function finalizationStagingPath(operationId, outputIndex) {
+  if (!isCanonicalOperationId(operationId) || !Number.isSafeInteger(outputIndex) || outputIndex < 0) {
+    const error = new Error('Invalid durable gallery staging identity.');
+    error.code = 'gallery_finalization_staging_identity_invalid';
+    throw error;
+  }
+  return path.join(FINALIZATION_STAGING, `${String(operationId).toLowerCase()}-${outputIndex}.bin`);
+}
+
+async function stageDurableOutput(operationId, output, content) {
+  const file = finalizationStagingPath(operationId, output.outputIndex);
+  try {
+    const existing = await fsp.readFile(file);
+    if (existing.length === output.bytes && hashAsset(existing) === output.sha256) return file;
+    const error = new Error(`Staged output ${output.outputIndex + 1} conflicts with its durable manifest.`);
+    error.code = 'gallery_finalization_staging_mismatch';
+    throw error;
+  } catch (error) {
+    if (error?.code !== 'ENOENT') throw error;
+  }
+  await atomicWriteFile(file, content);
+  const staged = await fsp.readFile(file);
+  if (staged.length !== output.bytes || hashAsset(staged) !== output.sha256) {
+    const error = new Error(`Could not verify staged output ${output.outputIndex + 1}.`);
+    error.code = 'gallery_finalization_staging_mismatch';
+    throw error;
+  }
+  return file;
+}
+
+async function stagedDurableOutput(operationId, output) {
+  try {
+    const content = await fsp.readFile(finalizationStagingPath(operationId, output.outputIndex));
+    if (content.length !== output.bytes || hashAsset(content) !== output.sha256) {
+      const error = new Error(`Staged output ${output.outputIndex + 1} no longer matches its durable manifest.`);
+      error.code = 'gallery_finalization_staging_mismatch';
+      throw error;
+    }
+    return content;
+  } catch (error) {
+    if (error?.code === 'ENOENT') return null;
+    throw error;
+  }
+}
+
+function cleanupDurableOutputStaging(manifest) {
+  for (const output of manifest?.outputs || []) {
+    const file = finalizationStagingPath(manifest.operationId, output.outputIndex);
+    fsp.unlink(file).catch(() => {});
+  }
+}
+
+function finalizationNeedsAttention(error) {
+  const code = String(error?.code || '');
+  if (code.startsWith('finalization_')) return true;
+  return new Set([
+    'gallery_finalization_conflict',
+    'gallery_finalization_operation_id_invalid',
+    'gallery_finalization_manifest_conflict',
+    'gallery_finalization_manifest_corrupt',
+    'gallery_finalization_manifest_directory_required',
+    'gallery_finalization_staging_identity_invalid',
+    'gallery_finalization_staging_mismatch',
+    'gallery_finalization_output_count_mismatch',
+    'gallery_finalization_asset_content_required',
+    'gallery_finalization_asset_content_mismatch',
+    'gallery_finalization_catalog_mismatch',
+    'gallery_finalization_plan_blocked',
+    'gallery_finalization_async_database_mutation',
+    'gallery_finalization_database_invalid',
+    'gallery_finalization_database_corrupt',
+    'gallery_finalization_database_path_required',
+    'gallery_finalization_database_store_required',
+    'gallery_finalization_manifest_store_required',
+    'gallery_finalization_media_directory_required',
+    'gallery_finalization_history_limit_invalid',
+  ]).has(code);
+}
+
+function deferDurableFinalization(pid, job, error) {
+  if (!job || !jobs.has(pid)) return;
+  const attentionRequired = finalizationNeedsAttention(error);
+  job.completing = false;
+  persistJob(pid, {
+    submissionState: attentionRequired ? 'attention' : (job.finalization ? 'finalizing' : 'output_ready'),
+    finalizationRetryAt: Date.now() + 2500,
+    recoveryError: attentionRequired ? {
+      code: String(error?.code || 'gallery_finalization_attention'),
+      message: String(error?.message || error || 'Gallery finalization needs attention.'),
+      attentionRequired: true,
+    } : undefined,
+  });
+  broadcast('status', {
+    jobId: pid,
+    profileId: job.profileId,
+    kind: job.kind,
+    text: attentionRequired
+      ? 'This completed generation needs attention before it can be added to the gallery.'
+      : 'Generation complete. Safely finishing the gallery record…',
+    itemId: null,
+  });
+}
+
+function handleCompletionFailure(pid, error) {
+  const job = jobs.get(pid);
+  if (durableGenerationFinalizationEligible(pid, job)) {
+    deferDurableFinalization(pid, job, error);
+    return;
+  }
+  failJob(pid, error?.message || 'Could not finalize ComfyUI output');
+}
+
+function settleDurableGalleryResult(pid, job, result) {
+  if (result.status === 'cancelled') {
+    cancelJob(pid, job.cancelMessage || 'Cancelled by user');
+    return true;
+  }
+  if (result.status === 'attention') {
+    const error = new Error('A deterministic gallery record conflicts with existing data.');
+    error.code = 'gallery_finalization_conflict';
+    deferDurableFinalization(pid, job, error);
+    return true;
+  }
+  if (result.status !== 'complete') return false;
+  const created = result.manifest.outputs.map((output) => db.items.find((item) => (
+    item.id === output.itemId && item.profileId === job.profileId
+  ))).filter(Boolean);
+  if (created.length !== result.manifest.outputs.length) {
+    const error = new Error('A finalized gallery item is missing from the durable database commit.');
+    error.code = 'gallery_finalization_catalog_mismatch';
+    deferDurableFinalization(pid, job, error);
+    return true;
+  }
+  cleanupDurableOutputStaging(result.manifest);
+  jobs.delete(pid);
+  broadcast('jobDone', { jobId: pid, items: created, sequenceComplete: false });
+  return true;
+}
+
+async function resumeDurableGalleryFromLocal(pid, job) {
+  if (!job?.finalization || !Array.isArray(job.finalizationOutputs) || job.completing) return false;
+  if (job.recoveryError?.attentionRequired) return true;
+  const descriptors = [];
+  for (const output of job.finalization.outputs || []) {
+    const descriptor = job.finalizationOutputs.find((entry) => entry.outputIndex === output.outputIndex);
+    if (!descriptor) return false;
+    let content;
+    try { await fsp.access(path.join(IMAGES, output.filename)); }
+    catch {
+      content = await stagedDurableOutput(job.operationId || pid, output);
+      if (!content) return false;
+    }
+    descriptors.push(content ? { ...descriptor, content } : descriptor);
+  }
+  job.completing = true;
+  try {
+    const result = await durableGalleryFinalizer.finalize({
+      manifest: job.finalization,
+      outputs: descriptors,
+    });
+    return settleDurableGalleryResult(pid, job, result);
+  } catch (error) {
+    deferDurableFinalization(pid, job, error);
+    return true;
+  }
+}
+
 async function completeJob(pid) {
   const job = jobs.get(pid);
   if (!job) return;
+  if (job.cancelRequested && ['gen', 'loraHunt'].includes(job.kind)) {
+    await reconcileDurableCancellation(pid, job);
+    return;
+  }
   if (job.kind === 'smartMask') {
     // Keep this job in the Map until its output has been verified. The old
     // lifecycle removed it before checking /history, so a missing or delayed
@@ -3032,9 +3305,29 @@ async function completeJob(pid) {
   if (job.completing) return;
   job.completing = true;
   let durationMs = jobDurationMs(job);
-  const res = await comfyFetch(`/history/${pid}`);
-  const hist = (await res.json())[pid];
-  if (!hist) return failJob(pid, 'No history entry from ComfyUI');
+  let hist;
+  try {
+    const res = await comfyFetch(`/history/${pid}`);
+    hist = (await res.json())[pid];
+  } catch (error) {
+    if (durableGenerationFinalizationEligible(pid, job)) {
+      deferDurableFinalization(pid, job, error);
+      return;
+    }
+    throw error;
+  }
+  if (!hist) {
+    if (durableGenerationFinalizationEligible(pid, job)) {
+      job.completing = false;
+      if (await resumeDurableGalleryFromLocal(pid, job)) return;
+      deferDurableFinalization(pid, job, new Error('Waiting for the original ComfyUI output history.'));
+      return;
+    }
+    return failJob(pid, 'No history entry from ComfyUI');
+  }
+  if (durableGenerationFinalizationEligible(pid, job)) {
+    persistJob(pid, { submissionState: 'output_ready', recoveryError: undefined });
+  }
   const outputs = hist.outputs || {};
 
   // text output (PreviewAny)
@@ -3245,7 +3538,13 @@ async function completeJob(pid) {
   }
 
   const files = findOutputFiles(outputs, /\.(png|jpg|jpeg|webp)$/i);
-  if (!files.length) return failJob(pid, 'ComfyUI produced no output images');
+  if (!files.length) {
+    if (durableGenerationFinalizationEligible(pid, job)) {
+      deferDurableFinalization(pid, job, new Error('ComfyUI has not exposed the completed image output yet.'));
+      return;
+    }
+    return failJob(pid, 'ComfyUI produced no output images');
+  }
 
   if (job.kind === 'loraHunt') {
     return completeStrengthHuntJob(pid, job, files, durationMs, textOut);
@@ -3334,19 +3633,85 @@ async function completeJob(pid) {
 
   const editSequence = job.params.editSequence;
   const sequenceFinal = !editSequence || editSequence.index >= editSequence.prompts.length - 1;
+  const durableFinalization = durableGenerationFinalizationEligible(pid, job);
+  const orderedFiles = durableFinalization
+    ? [...files].sort((left, right) => `${left.subfolder || ''}/${left.filename || ''}`
+      .localeCompare(`${right.subfolder || ''}/${right.filename || ''}`))
+    : files;
+  const durableBuffers = [];
+  if (durableFinalization) {
+    for (const outputFile of orderedFiles) {
+      durableBuffers.push(await downloadImageOutput(outputFile));
+      if (job.cancelRequested) {
+        await reconcileDurableCancellation(pid, job);
+        return;
+      }
+    }
+    if (!job.finalization) {
+      const manifest = createGalleryFinalizationManifest({
+        operationId: job.operationId || pid,
+        profileId: job.profileId,
+        workflow: job.workflowContractId || job.params.elementWorkflow || job.params.mode || 'generation',
+        createdAt: Date.now(),
+        outputs: durableBuffers.map((buffer, outputIndex) => ({
+          outputIndex,
+          kind: 'image',
+          role: 'output',
+          extension: '.png',
+          sha256: hashAsset(buffer),
+          bytes: buffer.length,
+        })),
+      });
+      persistJob(pid, { finalization: manifest, submissionState: 'finalizing' });
+    } else if (job.finalization.outputs.length !== durableBuffers.length) {
+      const error = new Error('ComfyUI returned a different number of outputs while resuming gallery finalization.');
+      error.code = 'gallery_finalization_output_count_mismatch';
+      deferDurableFinalization(pid, job, error);
+      return;
+    }
+    for (let outputIndex = 0; outputIndex < durableBuffers.length; outputIndex += 1) {
+      const output = job.finalization.outputs[outputIndex];
+      const buffer = durableBuffers[outputIndex];
+      if (output.sha256 !== hashAsset(buffer) || output.bytes !== buffer.length) {
+        const error = new Error(`ComfyUI output ${outputIndex + 1} changed while resuming gallery finalization.`);
+        error.code = 'gallery_finalization_asset_content_mismatch';
+        deferDurableFinalization(pid, job, error);
+        return;
+      }
+    }
+    for (let outputIndex = 0; outputIndex < durableBuffers.length; outputIndex += 1) {
+      await stageDurableOutput(
+        job.operationId || pid,
+        job.finalization.outputs[outputIndex],
+        durableBuffers[outputIndex],
+      );
+    }
+  }
   const created = [];
-  for (const img of files) {
-    const buf = await downloadOutput(img);
-    const id = uid();
-    const fname = settings.smartFilenames
+  const durableDescriptors = [];
+  for (let outputIndex = 0; outputIndex < orderedFiles.length; outputIndex += 1) {
+    const img = orderedFiles[outputIndex];
+    const buf = durableFinalization ? durableBuffers[outputIndex] : await downloadOutput(img);
+    const finalizationOutput = durableFinalization ? job.finalization.outputs[outputIndex] : null;
+    if (finalizationOutput && (finalizationOutput.sha256 !== hashAsset(buf) || finalizationOutput.bytes !== buf.length)) {
+      const error = new Error(`ComfyUI output ${outputIndex + 1} changed while resuming gallery finalization.`);
+      error.code = 'gallery_finalization_asset_content_mismatch';
+      deferDurableFinalization(pid, job, error);
+      return;
+    }
+    const storedDescriptor = durableFinalization
+      ? job.finalizationOutputs?.find((entry) => entry.outputIndex === outputIndex)
+      : null;
+    const id = finalizationOutput?.itemId || uid();
+    const fname = finalizationOutput?.filename || (settings.smartFilenames
       ? smartAssetFilename(job.params.prompt, id, '.png', job.params.mode === 'edit' ? 'edit' : 'image')
-      : `${id}.png`;
-    await fsp.writeFile(path.join(IMAGES, fname), buf);
+      : `${id}.png`);
+    if (!durableFinalization) await fsp.writeFile(path.join(IMAGES, fname), buf);
     // Keep a durable copy of edit and image-to-image sources so gallery
     // reuse still works if ComfyUI's input folder is later cleaned.
-    let sourceFile = null;
+    let sourceFile = storedDescriptor?.item?.sourceFile || null;
     const sourceImageName = job.refImageNames && job.refImageNames[0];
-    if (sourceImageName && (job.params.mode === 'edit' || job.params.imageName)) {
+    if (!sourceFile && sourceImageName && (job.params.mode === 'edit' || job.params.imageName)) {
       try {
         const parts = String(sourceImageName).split('/');
         const fn = parts.pop();
@@ -3443,13 +3808,42 @@ async function completeJob(pid) {
       loras: (job.params.loras || []).filter((l) => l.on && l.name),
       refImages: job.refImageNames || [],
       folder: job.params.folder || null,
-      createdAt: Date.now(),
+      createdAt: durableFinalization ? job.finalization.createdAt + outputIndex : Date.now(),
       durationMs,
       upscaled: null,
       video: null,
     };
-    db.items.unshift(item);
+    if (durableFinalization) {
+      const history = {
+        kind: item.mode === 'edit' ? 'edit' : 'gen',
+        durationMs,
+        label: `${item.mode === 'edit' ? 'Edit' : 'Create'}: ${(item.prompt || '').slice(0, 60)}`,
+        ts: job.finalization.createdAt + outputIndex,
+      };
+      durableDescriptors.push(storedDescriptor
+        ? { ...storedDescriptor, content: buf }
+        : { outputIndex, content: buf, item, history });
+    } else {
+      db.items.unshift(item);
+    }
     created.push(item);
+  }
+  if (durableFinalization) {
+    if (!Array.isArray(job.finalizationOutputs)) {
+      persistJob(pid, {
+        finalizationOutputs: durableDescriptors.map(({ content, ...descriptor }) => descriptor),
+      });
+    }
+    try {
+      const result = await durableGalleryFinalizer.finalize({
+        manifest: job.finalization,
+        outputs: durableDescriptors,
+      });
+      settleDurableGalleryResult(pid, job, result);
+    } catch (error) {
+      deferDurableFinalization(pid, job, error);
+    }
+    return;
   }
   saveDb();
   if (job.params.postUpscale && sequenceFinal) {
@@ -3516,6 +3910,9 @@ setInterval(async () => {
         await reconcileDurableCancellation(pid, durableJob);
         continue;
       }
+      if (Number(durableJob?.finalizationRetryAt) > Date.now()) continue;
+      if (durableGenerationFinalizationEligible(pid, durableJob)
+        && await resumeDurableGalleryFromLocal(pid, durableJob)) continue;
       const hist = (await (await comfyFetch(`/history/${pid}`)).json())[pid];
       if (hist && hist.status && hist.status.completed) await completeJob(pid);
       else if (hist && hist.status && hist.status.status_str === 'error') failJob(pid, 'Execution error (see ComfyUI console)');
@@ -3541,7 +3938,7 @@ setInterval(async () => {
         }
       }
     } catch (error) {
-      if (jobs.get(pid)?.completing) failJob(pid, error.message || 'Could not finalize ComfyUI output');
+      if (jobs.get(pid)?.completing) handleCompletionFailure(pid, error);
       // Otherwise ComfyUI is temporarily offline; retry on the next poll.
     }
   }
@@ -11796,7 +12193,11 @@ async function handleApi(req, res, url) {
   }
 
   if (route === '/api/queue/reset' && req.method === 'POST') {
-    const clearedJobs = [...jobs.keys()];
+    const protectedFinalizations = [...jobs.entries()]
+      .filter(([, job]) => job.finalization || ['output_ready', 'finalizing', 'finalized'].includes(job.submissionState))
+      .map(([pid]) => pid);
+    const protectedSet = new Set(protectedFinalizations);
+    const clearedJobs = [...jobs.keys()].filter((pid) => !protectedSet.has(pid));
     for (const pid of clearedJobs) {
       const job = jobs.get(pid);
       if (!job) continue;
@@ -11815,8 +12216,14 @@ async function handleApi(req, res, url) {
     for (const pid of clearedJobs) {
       cancelJob(pid, 'Stopped by hard reset');
     }
-    broadcast('queueReset', { profileId: req.profile.id, reset, clearedJobs: clearedJobs.length });
-    return json(res, 200, { ok: true, reset, clearedJobs: clearedJobs.length });
+    broadcast('queueReset', {
+      profileId: req.profile.id, reset, clearedJobs: clearedJobs.length,
+      protectedFinalizations: protectedFinalizations.length,
+    });
+    return json(res, 200, {
+      ok: true, reset, clearedJobs: clearedJobs.length,
+      protectedFinalizations: protectedFinalizations.length,
+    });
   }
 
   if (route === '/api/private/status') {

@@ -40,6 +40,30 @@ test('stable submission lifecycle survives restart before Comfy acknowledgement'
   assert.equal(restored.cancelRequestedAt, 124);
 });
 
+test('gallery finalization checkpoints and record descriptors survive restart', (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'mix-job-journal-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const file = path.join(root, 'pending.json');
+  const operationId = '7ecfc3f0-ea78-4e8e-b1e4-7fbf13e24a74';
+  const finalization = {
+    version: 1, operationId, profileId: 'owner', workflow: 'create:krea2-elements',
+    phase: 'prepared', completed: false, cancelRequested: false, lateCancellation: false,
+    conflict: null, createdAt: 1234,
+    outputs: [{ outputIndex: 0, itemId: 'item', filename: 'asset.png' }],
+  };
+  const finalizationOutputs = [{ outputIndex: 0, item: { prompt: 'test' }, history: { kind: 'gen' } }];
+  const job = {
+    kind: 'gen', profileId: 'owner', params: { prompt: 'test' }, graph: { save: {} },
+    operationId, promptId: operationId, submissionState: 'finalizing',
+    finalization, finalizationOutputs, finalizationRetryAt: 5678,
+  };
+  assert.equal(createJobJournal(file).put(operationId, job), true);
+  const restored = createJobJournal(file).entries()[0][1];
+  assert.deepEqual(restored.finalization, finalization);
+  assert.deepEqual(restored.finalizationOutputs, finalizationOutputs);
+  assert.equal(restored.finalizationRetryAt, 5678);
+});
+
 test('legacy durable jobs adopt their journal key as stable operation identity', (t) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'mix-job-journal-'));
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));
@@ -62,6 +86,32 @@ test('ephemeral jobs are not persisted', (t) => {
   const journal = createJobJournal(path.join(root, 'pending.json'));
   assert.equal(journal.put('prompt-1', { kind: 'enhance', profileId: 'owner', params: {}, graph: {} }), false);
   assert.deepEqual(journal.entries(), []);
+});
+
+test('a corrupt durable journal fails closed instead of silently erasing the queue', (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'mix-job-journal-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const file = path.join(root, 'pending.json');
+  fs.writeFileSync(file, '{"version":1,"jobs":[');
+  assert.throws(() => createJobJournal(file), { code: 'job_journal_corrupt' });
+  assert.equal(fs.readFileSync(file, 'utf8'), '{"version":1,"jobs":[');
+});
+
+test('valid JSON with an invalid journal version or schema fails closed', (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'mix-job-journal-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const file = path.join(root, 'pending.json');
+  const validJob = { kind: 'gen', profileId: 'owner', params: {}, graph: {} };
+  for (const [document, code] of [
+    [{ version: 2, jobs: [] }, 'job_journal_version_invalid'],
+    [{ version: 1 }, 'job_journal_corrupt'],
+    [{ version: 1, jobs: [{ id: '', job: {} }] }, 'job_journal_corrupt'],
+    [{ version: 1, jobs: [{ id: 'same', job: validJob }, { id: 'same', job: validJob }] }, 'job_journal_corrupt'],
+  ]) {
+    fs.writeFileSync(file, JSON.stringify(document));
+    assert.throws(() => createJobJournal(file), { code });
+    assert.deepEqual(JSON.parse(fs.readFileSync(file, 'utf8')), document);
+  }
 });
 
 test('a completed Mix image graph can be reconstructed for disaster recovery', () => {
