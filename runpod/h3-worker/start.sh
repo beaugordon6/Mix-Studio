@@ -2,7 +2,15 @@
 set -euo pipefail
 
 COMFY_DIR="/comfyui"
-VOLUME_ROOT="${RUNPOD_VOLUME_PATH:-/runpod-volume}"
+if [[ -n "${RUNPOD_VOLUME_PATH:-}" ]]; then
+  VOLUME_ROOT="$RUNPOD_VOLUME_PATH"
+elif [[ -d "/runpod-volume/models" ]]; then
+  VOLUME_ROOT="/runpod-volume"
+else
+  # RunPod templates created from older Pod-backed volumes expose the volume
+  # at /workspace. Detect it explicitly instead of failing every cold start.
+  VOLUME_ROOT="/workspace"
+fi
 
 if [[ ! -d "$VOLUME_ROOT/models" ]]; then
   echo "H3 network volume is not mounted at $VOLUME_ROOT" >&2
