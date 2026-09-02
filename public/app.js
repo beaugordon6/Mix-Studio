@@ -5842,6 +5842,7 @@ function genLabel() {
   if (setupAction === 'install') return 'Install workflow';
   if (setupAction === 'update') return 'Update ComfyUI';
   if (setupAction === 'connect') return 'Set up generation';
+  if (setupAction === 'restore-model') return 'Check model';
   const activeCount = state.activeJobs.size + state.motionPromptRequestsPending;
   if (activeCount) {
     return `➕ Add to Queue · ${activeCount} active`;
@@ -36403,7 +36404,11 @@ function setupActionForComponents(required) {
   if (requiresKrea2
     && lastMeta?.krea2?.modelVariant === 'int8-convrot'
     && lastMeta?.krea2?.nativeInt8?.supported !== true) return 'update';
-  return missingSetupComponents(components).length ? 'install' : '';
+  const missing = new Set(missingSetupComponents(components));
+  const manualMissing = (lastMeta?.dependencies?.diagnostics?.components || [])
+    .some((entry) => missing.has(entry.id) && entry.installable === false && entry.blockedBy === 'configured-model');
+  if (manualMissing) return 'restore-model';
+  return missing.size ? 'install' : '';
 }
 
 function currentGenerationSetupAction() {
@@ -36427,6 +36432,8 @@ async function ensureGenerationSetup() {
     && lastMeta?.wanAnimate2?.supported !== true;
   if (lastMeta?.ok && !missing.length && !nativeInt8Blocked && !krea2CoreBlocked && !h3CoreBlocked && !ltx25CoreBlocked && !wanAnimate2CoreBlocked) return true;
   const setupAction = setupActionForComponents(required);
+  const configuredModelDiagnostic = (lastMeta?.dependencies?.diagnostics?.components || [])
+    .find((entry) => missing.includes(entry.id) && entry.blockedBy === 'configured-model');
   saveForm();
   await openInitialSetup({
     components: missing.length ? missing : required,
@@ -36441,9 +36448,11 @@ async function ensureGenerationSetup() {
       ? 'Update ComfyUI to 0.26.0 or newer before using Krea 2.'
       : (nativeInt8Blocked
       ? 'Update ComfyUI for Krea 2 INT8 ConvRot, or choose the compatible FP8 route.'
+      : (configuredModelDiagnostic
+      ? (configuredModelDiagnostic.reasons?.[0] || 'Restore the configured Krea 2 model in the active ComfyUI models folder, then check again.')
       : (lastMeta?.ok
       ? 'This workflow needs a few desktop tools before it can run.'
-      : 'Connect ComfyUI, then install what this workflow needs.'))))),
+      : 'Connect ComfyUI, then install what this workflow needs.')))))),
   });
   return false;
 }

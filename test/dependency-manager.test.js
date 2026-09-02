@@ -1144,6 +1144,8 @@ test('an explicit post-restart check clears stale restart-required state', () =>
   assert.match(server, /restartRequired: false/);
   assert.match(app, /loadMeta\(true, true\)/);
   assert.match(server, /dependencyReadinessDiagnostics/);
+  assert.match(server, /configured_model_unavailable/);
+  assert.match(server, /Mix Studio will not replace a custom model with a stock checkpoint/);
   assert.match(server, /missingNodes/);
   assert.match(server, /missingModels/);
   assert.match(server, /customNodesPath: isAdmin\(\)/);

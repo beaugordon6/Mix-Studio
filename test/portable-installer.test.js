@@ -506,6 +506,8 @@ test('generation setup lives in the web app and gates only a generation attempt'
   assert.match(app, /if \(setupAction === 'install'\) return 'Install workflow'/);
   assert.match(app, /if \(setupAction === 'update'\) return 'Update ComfyUI'/);
   assert.match(app, /if \(setupAction === 'connect'\) return 'Set up generation'/);
+  assert.match(app, /if \(setupAction === 'restore-model'\) return 'Check model'/);
+  assert.match(app, /entry\.blockedBy === 'configured-model'/);
   assert.ok(
     app.indexOf('if (currentGenerationSetupAction()) {') < app.indexOf('const rawPrompt = promptForGeneration().trim()'),
     'generation setup should open before prompt validation when the workflow is unavailable'

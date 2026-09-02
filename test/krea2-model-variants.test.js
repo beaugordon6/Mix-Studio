@@ -8,6 +8,7 @@ const test = require('node:test');
 const {
   buildKrea2ModelLoader,
   effectiveKrea2Variant,
+  isManagedKrea2TurboModel,
   krea2VariantSettings,
   normalizeKrea2Variant,
   recommendedKrea2Variant,
@@ -41,6 +42,12 @@ test('Krea 2 variant inference recognizes manually selected ConvRot files', () =
     unet: 'krea2_turbo_int8_convrot.safetensors',
     krea2RawUnet: 'krea2_raw_fp8_scaled.safetensors',
   }), 'int8-convrot');
+});
+
+test('managed Krea checkpoints are distinguished from custom compatible models', () => {
+  assert.equal(isManagedKrea2TurboModel('krea2_turbo_fp8_scaled.safetensors'), true);
+  assert.equal(isManagedKrea2TurboModel('subfolder\\krea2_turbo_int8_convrot.safetensors'), true);
+  assert.equal(isManagedKrea2TurboModel('homofidelisKrea2NSFW_v10TURBOINT8Convrot.safetensors'), false);
 });
 
 test('dependency planning resolves the requested variant before saved settings', () => {
