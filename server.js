@@ -210,6 +210,8 @@ const {
   publicUploadedAsset,
 } = require('./lib/uploaded-assets');
 const {
+  elementConditioningMode,
+  groundElementPrompt,
   normalizeElement,
   publicElement,
   resolvePromptElements,
@@ -497,7 +499,7 @@ Follow these rules strictly:
 5. **Avoid Over-Specification:** Do not invent highly specific clothing, colors, materials, or scene details unless the input supports them.
 6. **Structure:** Write one cohesive paragraph after the thinking block. No bullets, JSON, or markdown.
 7. **Respect Existing Detail:** If the user's prompt is already detailed, lightly polish and finalize rather than heavily expanding - preserve their phrasing and direction.
-8. **Respect the Human Form:** Treat depictions of people with dignity. Assume clothing covers genitals and intimate anatomy.
+8. **Respect Explicit Intent:** Treat adult depictions neutrally. Never add nudity or intimate anatomy unless the user explicitly requests it. When an adult user explicitly requests nudity, anatomy, clothing state, or sexual state, preserve those details exactly rather than covering, censoring, or intensifying them.
 9. **Preserve User Medium:** When the user explicitly requests a medium (e.g. "photo of", "photograph of", "illustration of", "painting of", "sketch of", "3D render of"), honor it. Do not pivot to a different medium to avoid difficulty - match the user's stated intent.
 
 User's Input:`;
@@ -514,6 +516,10 @@ const DEFAULT_SETTINGS = {
   krea2TurboLora: 'krea2_turbo_lora_rank_64_bf16.safetensors',
   krea2DepthLora: 'depth-control-lora.safetensors',
   krea2OutpaintLora: 'krea2_identity_edit_v1_2.safetensors',
+  // Keep the identity workflow on its validated Krea 2 base. It must not
+  // silently inherit whichever general-purpose model happens to be selected.
+  krea2ElementUnet: 'krea2_turbo_fp8_scaled.safetensors',
+  krea2ElementLora: 'krea2_identity_edit_v1_2_r64.safetensors',
   depthAnythingV3Model: 'da3_large.safetensors',
   clip: 'Huihui-Qwen3-VL-4B-Instruct-abliterated-fp8_scaled.safetensors',
   clipType: 'krea2',
@@ -630,6 +636,7 @@ function normalizeSettings(s) {
   s.h3TurboLora = String(s.h3TurboLora || '').trim() || DEFAULT_H3_TURBO_LORA;
   s.h3RefTurboLora = String(s.h3RefTurboLora || '').trim() || H3_TURBO_LORAS.referenceRecommended;
   s.hfEndpoint = normalizeHuggingFaceEndpoint(s.hfEndpoint);
+  if (!String(s.krea2ElementUnet || '').trim()) s.krea2ElementUnet = DEFAULT_SETTINGS.krea2ElementUnet;
   if (!s.klein4Unet) s.klein4Unet = s.kleinUnet || DEFAULT_SETTINGS.klein4Unet;
   if (!s.klein4Clip) s.klein4Clip = s.kleinClip || DEFAULT_SETTINGS.klein4Clip;
   if (!s.klein9Unet) s.klein9Unet = DEFAULT_SETTINGS.klein9Unet;
@@ -1693,6 +1700,11 @@ function configuredModelsStatus(info) {
       label: 'Krea 2 Identity Edit',
       lora: modelStatus(info, 'LoraLoaderModelOnly', 'lora_name', settings.krea2OutpaintLora, loraList),
     },
+    krea2Elements: {
+      label: 'Visual Elements',
+      unet: diffusionModelStatus(info, settings.krea2ElementUnet),
+      identityLora: modelStatus(info, 'LoraLoaderModelOnly', 'lora_name', settings.krea2ElementLora, loraList),
+    },
     klein4: {
       label: 'Flux Klein 4B',
       unet: diffusionModelStatus(info, settings.klein4Unet),
@@ -1823,6 +1835,7 @@ const DEPENDENCY_NODE_GROUP_COMPONENTS = Object.freeze({
     regional: ['regional'],
     krea2ref: ['krea2ref'],
     krea2remix: ['krea2remix'],
+    elements: ['elements'],
     krea2outpaint: ['krea2outpaint'],
     editoutpaint: ['editoutpaint'],
     smartmask: ['smartmask'],
@@ -1859,6 +1872,7 @@ const DEPENDENCY_NODE_GROUP_COMPONENTS = Object.freeze({
 const DEPENDENCY_MODEL_GROUP_COMPONENTS = Object.freeze({
   krea2Depth: ['krea2depth'],
   krea2IdentityEdit: ['krea2ref', 'krea2outpaint'],
+  krea2Elements: ['elements'],
   klein4: ['klein4'],
   klein9: ['klein9'],
   qwen: ['qwen'],
@@ -2497,6 +2511,10 @@ async function completeStrengthHuntJob(pid, job, outputFiles, durationMs, textOu
       regions: Array.isArray(job.params.regions) && job.params.regions.length
         ? normalizeRegions(job.params.regions) : undefined,
       prompt: job.params.authoredPrompt || job.params.prompt,
+      executedPrompt: job.params.executedPrompt || undefined,
+      elementsUsed: Array.isArray(job.params.elementsUsed) ? job.params.elementsUsed : undefined,
+      elementWorkflow: job.params.elementWorkflow || undefined,
+      elementModel: job.params.elementModel || undefined,
       negativePrompt: job.params.negativePrompt || undefined,
       promptTemplate: job.params.promptTemplate,
       promptPresets: job.params.promptPresets,
@@ -3116,6 +3134,10 @@ async function completeJob(pid) {
       regions: Array.isArray(job.params.regions) && job.params.regions.length
         ? normalizeRegions(job.params.regions) : undefined,
       prompt: job.params.authoredPrompt || job.params.prompt,
+      executedPrompt: job.params.executedPrompt || undefined,
+      elementsUsed: Array.isArray(job.params.elementsUsed) ? job.params.elementsUsed : undefined,
+      elementWorkflow: job.params.elementWorkflow || undefined,
+      elementModel: job.params.elementModel || undefined,
       negativePrompt: job.params.negativePrompt || undefined,
       promptTemplate: job.params.promptTemplate,
       promptPresets: job.params.promptPresets,
@@ -4740,12 +4762,16 @@ async function buildEditKrea2Identity(p, refNames) {
     ? comboList(info, 'LoraLoaderModelOnly', 'lora_name')
     : comboList(info, 'LoraLoader', 'lora_name');
   const assetKey = (value) => String(value || '').replace(/\\/g, '/').split('/').pop().toLowerCase();
-  if (!loraList.some((name) => assetKey(name) === assetKey(settings.krea2OutpaintLora))) {
-    throw new Error(`Krea 2 Edit needs the Identity Edit LoRA in ComfyUI loras: ${settings.krea2OutpaintLora}`);
+  const identityLora = p.elementIdentityMode ? settings.krea2ElementLora : settings.krea2OutpaintLora;
+  if (!loraList.some((name) => assetKey(name) === assetKey(identityLora))) {
+    throw new Error(`Krea 2 Edit needs the Identity Edit LoRA in ComfyUI loras: ${identityLora}`);
   }
   await matchKrea2ReferenceDimensions(p, refNames);
   return filterInputs(buildKrea2IdentityEditGraph(Object.assign({}, p, {
-    settings,
+    settings: Object.assign({}, settings, {
+      unet: p.elementIdentityMode ? settings.krea2ElementUnet : settings.unet,
+      krea2OutpaintLora: identityLora,
+    }),
     refNames: refNames.slice(0, 2),
     groundingPx: 768,
   })));
@@ -4766,7 +4792,7 @@ async function buildEditKrea2Remix(p, refNames) {
   const { width, height } = await matchKrea2ReferenceDimensions(p, refNames);
 
   const rebalanceInputs = {
-    text: p.prompt,
+    text: p.enhancedText || p.prompt,
     clip: ['clip', 0],
     // Conditioning-Rebalance renamed these controls. Keep both schemas here;
     // filterInputs() retains only the fields supported by the installed node.
@@ -4782,7 +4808,7 @@ async function buildEditKrea2Remix(p, refNames) {
     graph[`ref${k}`] = { class_type: 'LoadImage', inputs: { image: name } };
     rebalanceInputs[`image${k}`] = [`ref${k}`, 0];
     // The primary reference carries the subject: give it the bigger budget
-    rebalanceInputs[`image${k}_tokens`] = i === 0 ? 'high' : 'normal';
+    rebalanceInputs[`image${k}_tokens`] = 'normal';
   });
   graph.rebalance = { class_type: 'Krea2EditRebalance', inputs: rebalanceInputs };
   graph.guider = { class_type: 'BasicGuider', inputs: { model, conditioning: ['rebalance', 0] } };
@@ -5002,6 +5028,8 @@ async function buildEdit(p, refNames) {
 }
 
 async function buildGenerationGraph(p, refNames) {
+  if (p.mode !== 'edit' && p.elementIdentityMode) return buildEditKrea2Identity(p, refNames);
+  if (p.mode !== 'edit' && p.elementReferenceMode) return buildEditKrea2Remix(p, refNames);
   if (p.mode === 'edit') {
     if (p.editOutpaint && p.editEngine === 'qwen') return buildEditQwenOutpaint(p, refNames);
     if (p.editOutpaint && (p.editEngine === 'klein4' || p.editEngine === 'klein9')) return buildEditKleinOutpaint(p, refNames);
@@ -6774,6 +6802,8 @@ const REQUIRED_CLASSES = {
   faceid: ['LTXIdentityOverlapConditioning', 'ImageResizeKJv2', 'TextGenerate'],
   krea2ref: ['Krea2EditModelPatch', 'Krea2EditGroundedEncode', 'LoraLoaderModelOnly'],
   krea2remix: ['Krea2EditRebalance', 'BasicGuider', 'BasicScheduler', 'SamplerCustomAdvanced'],
+  elements: ['Krea2EditModelPatch', 'Krea2EditGroundedEncode', 'Krea2EditRebalance',
+    'LoraLoaderModelOnly', 'BasicGuider', 'BasicScheduler', 'SamplerCustomAdvanced'],
   krea2outpaint: ['Krea2EditModelPatch', 'Krea2EditGroundedEncode', 'ImagePadForOutpaint', 'ColorMatch', 'ImageToMask', 'SolidMask', 'FeatherMask'],
   editoutpaint: ['ImagePadForOutpaint', 'DrawMaskOnImage', 'ColorMatch', 'ImageToMask', 'SolidMask', 'FeatherMask'],
   krea2inpaint: ['LoadImage', 'ImageToMask', 'GrowMask', 'VAEEncode', 'SetLatentNoiseMask',
@@ -8248,6 +8278,7 @@ async function handleApi(req, res, url) {
           depthLora: settings.krea2DepthLora,
           depthModel: settings.depthAnythingV3Model,
           outpaintLora: settings.krea2OutpaintLora,
+          elementLora: settings.krea2ElementLora,
         },
         minimaxH3: Object.assign({}, h3Core, {
           frameVariant: h3FrameVariant(settings),
@@ -8898,21 +8929,62 @@ async function handleApi(req, res, url) {
       const editEngines = ['qwen', 'klein9', 'krea2', 'krea2ref', 'krea2remix'];
       p.editEngine = editEngines.includes(p.editEngine) ? p.editEngine : 'klein4';
     }
-    const elementCapacity = p.mode === 'edit' ? (p.editEngine === 'krea2ref' ? 2 : 3) : 1;
+    // One Element per Create keeps type routing deterministic. Edit may pair a
+    // source image with one Element, matching the stricter Identity path.
+    const elementCapacity = p.mode === 'edit' ? 2 : 1;
     const promptElements = resolvePromptElements(p.prompt, db.elements, req.profile.id, elementCapacity);
+    const elementMode = elementConditioningMode(promptElements.elements, p.mode);
     if (promptElements.overflowNames.length) {
       return json(res, 400, { error: `This workflow supports up to ${elementCapacity} Element references. Remove one @mention and try again.` });
     }
     if (promptElements.elements.length) {
-      if (p.mode !== 'edit' && p.imageName && p.imageGuideMode !== 'image') {
-        return json(res, 400, { error: 'Elements can be combined with an image guide, but not a depth or style guide yet.' });
+      const invalidElementAsset = promptElements.referenceNames.find((name) => !db.uploadedAssets.some((asset) => (
+        asset.name === name && asset.profileId === req.profile.id && asset.kind === 'image' && !asset.deletedAt
+      )));
+      if (invalidElementAsset) {
+        return json(res, 409, { error: 'This Element reference is unavailable. Edit the Element and choose its image again.' });
       }
-      p.prompt = replaceElementHandles(p.prompt, promptElements.elements);
+      for (const name of promptElements.referenceNames) {
+        try {
+          await fsp.access(inputAssetPath(INPUTS, name), fs.constants.R_OK);
+        } catch {
+          return json(res, 409, { error: 'This Element image is missing. Edit the Element and choose its image again.' });
+        }
+      }
+      if (p.mode !== 'edit' && p.imageName) {
+        return json(res, 400, { error: 'Use either an Element or an image, depth, or style guide for this generation—not both yet.' });
+      }
+      if (p.mode === 'edit') {
+        p.editEngine = elementMode === 'identity' ? 'krea2ref' : 'krea2remix';
+      }
+      p.elementIdentityMode = elementMode === 'identity';
+      p.elementReferenceMode = elementMode === 'remix';
+      p.prompt = ['identity', 'remix'].includes(elementMode)
+        ? groundElementPrompt(p.prompt, promptElements.elements)
+        : replaceElementHandles(p.prompt, promptElements.elements);
       p.elementHandles = promptElements.elements.map((element) => `@${element.handle}`);
+      p.elementsUsed = promptElements.elements.map((element) => ({
+        id: element.id,
+        handle: `@${element.handle}`,
+        type: element.type,
+        label: element.label,
+        assetNames: element.assetNames.slice(0, 1),
+      }));
+      p.elementWorkflow = elementMode;
+      p.elementModel = elementMode === 'identity' ? settings.krea2ElementUnet : settings.unet;
+      p.executedPrompt = p.prompt;
       if (p.mode !== 'edit' && promptElements.referenceNames[0]) {
         p.imageName = promptElements.referenceNames[0];
-        p.imageGuideMode = 'image';
-        p.denoise = 0.45;
+        if (['identity', 'remix'].includes(elementMode)) {
+          // Elements are appearance references, not initial canvases:
+          // use an empty latent at the selected output dimensions so the
+          // prompt controls framing instead of inheriting the source crop.
+          p.editAspectOverride = true;
+          p.imageGuideMode = undefined;
+        } else {
+          p.imageGuideMode = 'image';
+          p.denoise = 0.45;
+        }
       }
     }
     const usesKrea2Model = p.mode !== 'edit' || ['krea2', 'krea2ref', 'krea2remix'].includes(p.editEngine);
@@ -8927,6 +8999,26 @@ async function handleApi(req, res, url) {
           compatibility: krea2Compatibility,
         });
       }
+      if (p.elementIdentityMode || p.elementReferenceMode) {
+        const required = p.elementIdentityMode ? REQUIRED_CLASSES.krea2ref : REQUIRED_CLASSES.krea2remix;
+        const missingNodes = required.filter((className) => !info[className]);
+        if (missingNodes.length) {
+          return json(res, 409, {
+            error: `Elements need the Krea 2 reference-conditioning nodes installed: ${missingNodes.join(', ')}`,
+            code: 'element_reference_nodes_missing',
+          });
+        }
+        if (p.elementIdentityMode) {
+          const elementModels = configuredModelsStatus(info).krea2Elements;
+          const missingModels = Object.values(elementModels).filter((status) => status && typeof status === 'object' && status.ok === false);
+          if (missingModels.length) {
+            return json(res, 409, {
+              error: `Elements need their Krea 2 identity models installed: ${missingModels.map((status) => status.name).join(', ')}`,
+              code: 'element_reference_nodes_missing',
+            });
+          }
+        }
+      }
     }
 
     let refined = null;
@@ -8936,6 +9028,7 @@ async function handleApi(req, res, url) {
           const rawText = await enhancePrompt(p, req.profile.id);
           refined = cleanEnhancedText(rawText, p.prompt);
           p.enhancedText = refined;
+          if (p.elementsUsed?.length) p.executedPrompt = refined;
         }
       }
       const regionInputs = p.regions.map((region) => ({
@@ -11324,14 +11417,28 @@ async function handleApi(req, res, url) {
       ? db.elements.find((entry) => entry.id === body.id && entry.profileId === req.profile.id)
       : null;
     if (body.id && !existing) return json(res, 404, { error: 'Element not found' });
+    let pending;
+    try {
+      pending = normalizeElement({ handle: body.handle, type: body.type, label: body.label, assetNames: ['pending'] }, req.profile.id);
+    } catch (error) {
+      return json(res, 400, { error: error.message });
+    }
+    const duplicate = db.elements.find((entry) => (
+      entry.profileId === req.profile.id && entry.id !== existing?.id && entry.handle === pending.handle
+    ));
+    if (duplicate) return json(res, 409, { error: `@${pending.handle} already exists.` });
     let assetName = String(body.assetName || existing?.assetNames?.[0] || '').trim();
     if (body.sourceItemId) {
       const visible = galleryView(db, isPrivateUnlocked(req)).items.find((item) => (
         item.id === body.sourceItemId && item.profileId === req.profile.id
       ));
       if (!visible) return json(res, 404, { error: 'Generation not found' });
-      const sourceFile = visible.upscaled || visible.file;
-      const source = await fsp.readFile(path.join(IMAGES, sourceFile));
+      const sourceFile = storedMediaName(visible.upscaled || visible.file);
+      const sourcePath = path.resolve(IMAGES, sourceFile);
+      if (!sourceFile || (sourcePath !== IMAGES && !sourcePath.startsWith(IMAGES + path.sep))) {
+        return json(res, 400, { error: 'Generation image path is invalid.' });
+      }
+      const source = await fsp.readFile(sourcePath);
       const ext = path.extname(sourceFile) || '.png';
       assetName = await uploadToComfy(source, `ks_element_${Date.now()}_${crypto.randomBytes(4).toString('hex')}${ext}`);
       await fsp.writeFile(inputAssetPath(INPUTS, assetName), source);
@@ -11351,10 +11458,6 @@ async function handleApi(req, res, url) {
     } catch (error) {
       return json(res, 400, { error: error.message });
     }
-    const duplicate = db.elements.find((entry) => (
-      entry.profileId === req.profile.id && entry.id !== existing?.id && entry.handle === normalized.handle
-    ));
-    if (duplicate) return json(res, 409, { error: `@${normalized.handle} already exists.` });
     const now = Date.now();
     const element = existing || { id: uid(), createdAt: now };
     Object.assign(element, normalized, { updatedAt: now });

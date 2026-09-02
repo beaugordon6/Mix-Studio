@@ -55,7 +55,7 @@ test('Krea 2 Edit applies a configurable sampling preset without warning on its 
 
 test('dependency setup uses the latest full-rank Identity Edit v1.2 model and node revision', () => {
   assert.match(dependencies, /krea2_identity_edit_v1_2\.safetensors/);
-  assert.match(dependencies, /7e68e90983b25e64dd02ac5d0c10593ea72a4cde/);
+  assert.match(dependencies, /86f886dac23013d88996e3a2e99093ba44d322fb/);
   assert.match(dependencies, /krea2ref: \{ label: 'Krea 2 Edit', nodes: \['krea2Edit'\], models: \['image', 'krea2Outpaint'\] \}/);
   assert.match(dependencies, /krea2remix: \{ label: 'Krea 2 Remix', nodes: \['rebalance'\], models: \['image'\] \}/);
 });

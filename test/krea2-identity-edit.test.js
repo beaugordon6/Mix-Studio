@@ -21,6 +21,7 @@ test('identity edit uses the v1.2 dual-conditioning pixel path', () => {
     settings,
     refNames: ['scene.png', 'person.png', 'ignored.png'],
     prompt: 'Place this person beside the tractor.',
+    enhancedText: 'A polished instruction that keeps the person beside the tractor.',
     width: 1344,
     height: 768,
     seed: 12,
@@ -35,6 +36,7 @@ test('identity edit uses the v1.2 dual-conditioning pixel path', () => {
   assert.equal(graph.identity_lora.inputs.strength_model, 1);
   assert.deepEqual(graph.model_patch.inputs.model, ['user_lora_1', 0]);
   assert.deepEqual(graph.model_patch.inputs.source_latent, ['source_latent', 0]);
+  assert.deepEqual(graph.model_patch.inputs.target_latent, ['latent', 0]);
   assert.deepEqual(graph.model_patch.inputs.source_latent_b, ['source_latent_b', 0]);
   assert.deepEqual(graph.model_patch.inputs.vae, ['vae', 0]);
   assert.deepEqual(graph.model_patch.inputs.source_image, ['source', 0]);
@@ -45,6 +47,7 @@ test('identity edit uses the v1.2 dual-conditioning pixel path', () => {
   assert.deepEqual(graph.positive.inputs.image_b, ['source_b', 0]);
   assert.deepEqual(graph.negative.inputs.image_b, ['source_b', 0]);
   assert.equal(graph.negative.inputs.prompt, '');
+  assert.equal(graph.positive.inputs.prompt, 'A polished instruction that keeps the person beside the tractor.');
   assert.equal(graph.positive.inputs.grounding_px, 768);
   assert.equal(graph.sampler.inputs.steps, 10);
   assert.equal(graph.sampler.inputs.cfg, 1.8);

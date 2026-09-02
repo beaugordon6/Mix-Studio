@@ -943,10 +943,19 @@ html:-webkit-full-screen { background: #000; }
 .prompt-element-add,
 .prompt-element-chip { min-height: 34px; border: 1px solid var(--line); border-radius: 999px; background: rgba(255,255,255,.035); color: var(--ink-soft); font-size: 11px; font-weight: 850; white-space: nowrap; }
 .prompt-element-add { flex: 0 0 auto; padding: 0 12px; color: rgb(var(--mode-rgb)); border-color: rgba(var(--mode-rgb),.28); }
-.prompt-element-chip { display: inline-flex; align-items: center; gap: 7px; padding: 3px 10px 3px 4px; }
+.prompt-element-chip { display: inline-flex; align-items: center; padding: 3px 4px; }
+.prompt-element-open { display: inline-flex; align-items: center; gap: 7px; min-width: 0; padding: 0 6px 0 0; border: 0; background: transparent; color: inherit; font: inherit; }
 .prompt-element-chip img { width: 26px; height: 26px; border-radius: 50%; object-fit: cover; }
+.prompt-element-edit,
+.prompt-element-remove { display: grid; place-items: center; width: 26px; height: 26px; padding: 0; border: 0; border-radius: 50%; background: rgba(255,255,255,.08); color: var(--ink-soft); line-height: 1; }
+.prompt-element-edit { font-size: 14px; }
+.prompt-element-remove { font-size: 18px; }
+.prompt-element-edit:hover,
+.prompt-element-remove:hover { background: rgba(255,255,255,.15); color: var(--ink); }
 .prompt-element-chip.is-mentioned { color: var(--ink); border-color: rgba(var(--mode-rgb),.55); background: rgba(var(--mode-rgb),.11); }
-.prompt-element-chip:focus-visible,
+.prompt-element-open:focus-visible,
+.prompt-element-edit:focus-visible,
+.prompt-element-remove:focus-visible,
 .prompt-element-add:focus-visible { outline: 2px solid rgba(var(--mode-rgb),.7); outline-offset: 2px; }
 
 .element-sheet-panel { width: min(440px, 100%); }
@@ -1153,6 +1162,43 @@ html:-webkit-full-screen { background: #000; }
   user-select: none;
   box-shadow: 0 5px 15px rgba(27,53,122,0.22);
 }
+.prompt-element-token {
+  display: inline-flex;
+  align-items: center;
+  vertical-align: middle;
+  max-width: min(210px, 68vw);
+  height: 28px;
+  margin: 1px 3px 1px 0;
+  padding: 2px 3px;
+  gap: 2px;
+  border: 1px solid rgba(var(--mode-rgb), .58);
+  border-radius: 8px;
+  background: rgba(var(--mode-rgb), .13);
+  color: var(--ink);
+  font-size: 12px;
+  font-weight: 850;
+  line-height: 1;
+  user-select: none;
+}
+.prompt-element-token-open {
+  min-width: 0;
+  height: 22px;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 0 3px 0 0;
+  border: 0;
+  border-radius: 5px;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  cursor: pointer;
+}
+.prompt-element-token-open:hover { background: rgba(255,255,255,.08); }
+.prompt-element-token-open:focus-visible { outline: 2px solid rgba(var(--mode-rgb), .82); outline-offset: 1px; }
+.prompt-element-token img { width: 22px; height: 22px; flex: 0 0 auto; border-radius: 5px; object-fit: cover; }
+.prompt-element-token b { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.prompt-element-token .prompt-ref-remove { color: var(--ink-soft); }
 .prompt-ref-token img {
   width: 22px;
   height: 22px;
@@ -1589,6 +1635,13 @@ html:-webkit-full-screen { background: #000; }
 .krea-model-switch[aria-checked="true"] {
   border-color: rgba(var(--mode-rgb), .35);
   background: linear-gradient(120deg, rgba(var(--mode-rgb), .075), transparent 62%), rgba(3,4,7,.68);
+}
+.krea-model-switch.is-element-model:disabled {
+  cursor: default;
+  opacity: 1;
+}
+.krea-model-switch.is-element-model .switch {
+  opacity: .55;
 }
 .krea-model-switch-icon {
   width: 32px;

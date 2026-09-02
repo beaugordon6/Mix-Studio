@@ -35,6 +35,7 @@ test('installer manifest exposes optional edit and video components', () => {
   assert.deepEqual(optionalIds, Object.keys(DEFAULT_FEATURES).sort());
   assert.ok(ids.includes('core.image'));
   assert.ok(ids.includes('edit.qwen'));
+  assert.ok(ids.includes('edit.elements'));
   assert.ok(ids.includes('video.ltxEdit'));
   assert.ok(ids.includes('video.ltx25'));
   assert.ok(ids.includes('video.ltx25Quality'));
@@ -47,4 +48,8 @@ test('installer manifest exposes optional edit and video components', () => {
   const core = manifest.features.find((feature) => feature.id === 'core.image');
   assert.equal(core.models.includes('krea2-raw'), false);
   assert.equal(core.models.includes('krea2-turbo-lora'), false);
+  const elements = manifest.features.find((feature) => feature.id === 'edit.elements');
+  assert.equal(elements.default, true);
+  assert.ok(elements.models.includes('krea2-identity-edit-v1.2-r64-lora'));
+  assert.ok(elements.nodes.includes('Krea2EditRebalance'));
 });

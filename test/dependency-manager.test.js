@@ -51,10 +51,10 @@ function safetensorsFixture() {
 }
 
 test('dependency catalog covers every enabled image and video family', () => {
-  for (const component of ['image', 'krea2raw', 'krea2depth', 'krea2style', 'krea2outpaint', 'editoutpaint', 'klein4', 'klein9', 'qwen', 'upscale', 'video', 'ltx25', 'ltx25quality', 'h3', 'h3turbo', 'h3turbor2v', 'h3sage', 'h3sla', 'h3r2v', 'h3dyntime', 'ltxcamera', 'ltxdirector', 'videoedit', 'faceid', 'wan', 'eros', 'rife', 'scail', 'scailinfinity', 'smartmask', 'regional']) {
+  for (const component of ['image', 'elements', 'krea2raw', 'krea2depth', 'krea2style', 'krea2outpaint', 'editoutpaint', 'klein4', 'klein9', 'qwen', 'upscale', 'video', 'ltx25', 'ltx25quality', 'h3', 'h3turbo', 'h3turbor2v', 'h3sage', 'h3sla', 'h3r2v', 'h3dyntime', 'ltxcamera', 'ltxdirector', 'videoedit', 'faceid', 'wan', 'eros', 'rife', 'scail', 'scailinfinity', 'smartmask', 'regional']) {
     assert.ok(COMPONENTS[component], `${component} is installable`);
   }
-  for (const group of ['image', 'krea2Raw', 'krea2Depth', 'krea2Outpaint', 'klein4', 'klein9', 'qwen', 'upscale', 'ltx', 'ltx25', 'ltx25Quality', 'h3', 'h3RefCommon', 'h3Ref', 'h3Bf16', 'h3RefBf16', 'h3DynTimeRef', 'h3DynTimeRefHq', 'h3Turbo', 'h3TurboLegacy', 'h3TurboLightx8', 'h3TurboLightx4_768p', 'h3RefTurbo', 'h3RefTurboLightx8', 'h3RefTurboLightx4_768p', 'ltxCamera', 'ltxDirector', 'ltxEdit', 'faceid', 'wan', 'eros', 'scail']) {
+  for (const group of ['image', 'krea2Raw', 'krea2Depth', 'krea2Outpaint', 'krea2ElementIdentity', 'klein4', 'klein9', 'qwen', 'upscale', 'ltx', 'ltx25', 'ltx25Quality', 'h3', 'h3RefCommon', 'h3Ref', 'h3Bf16', 'h3RefBf16', 'h3DynTimeRef', 'h3DynTimeRefHq', 'h3Turbo', 'h3TurboLegacy', 'h3TurboLightx8', 'h3TurboLightx4_768p', 'h3RefTurbo', 'h3RefTurboLightx8', 'h3RefTurboLightx4_768p', 'ltxCamera', 'ltxDirector', 'ltxEdit', 'faceid', 'wan', 'eros', 'scail']) {
     assert.ok(MODEL_ASSETS[group]?.length, `${group} has model downloads`);
   }
   assert.ok(Object.values(NODE_PACKS).every((pack) => pack.repo.startsWith('https://github.com/')));
@@ -158,6 +158,12 @@ test('dependency catalog covers every enabled image and video family', () => {
   assert.match(NODE_PACKS.whatdreamscost.ref, /^[a-f0-9]{40}$/);
   assert.match(MODEL_ASSETS.ltxDirector[0][2], /Lightricks\/LTX-2\.3-22b-IC-LoRA-Ingredients/);
   assert.match(MODEL_ASSETS.krea2Outpaint[0][2], /conradlocke\/krea2-identity-edit/);
+  assert.deepEqual(COMPONENTS.elements.nodes, ['krea2Edit', 'rebalance']);
+  assert.deepEqual(COMPONENTS.elements.models, ['image', 'krea2ElementIdentity']);
+  assert.equal(MODEL_ASSETS.krea2ElementIdentity[0][0], 'krea2ElementUnet');
+  assert.match(MODEL_ASSETS.krea2ElementIdentity[0][2], /krea2_turbo_fp8_scaled\.safetensors$/);
+  assert.equal(MODEL_ASSETS.krea2ElementIdentity[1][0], 'krea2ElementLora');
+  assert.match(MODEL_ASSETS.krea2ElementIdentity[1][2], /krea2_identity_edit_v1_2_r64\.safetensors$/);
   assert.equal(MODEL_ASSETS.klein4.find((asset) => asset[0] === 'klein4ConsistencyLora')[1], 'loras');
   assert.match(MODEL_ASSETS.klein4.find((asset) => asset[0] === 'klein4Unet')[2], /FLUX\.2-klein-4b-fp8\/resolve\/main\/flux-2-klein-4b-fp8\.safetensors/);
   assert.match(MODEL_ASSETS.klein4.find((asset) => asset[0] === 'klein4ConsistencyLora')[2], /f2k_4B_consist_20260314\.safetensors/);
@@ -171,6 +177,32 @@ test('Ultimate SD Upscale installs the image upscaler model used by its graph', 
     ['ultimateUpscaleModel', 'upscale_models'],
   ]);
   assert.match(plan.assets[0][2], /4x_foolhardy_Remacri\.pth$/);
+});
+
+test('Visual Elements installs its exact identity LoRA and both conditioning node packs', () => {
+  const plan = dependencyModelPlan(COMPONENTS.elements.models, {});
+  const base = plan.assets.find((asset) => asset[0] === 'krea2ElementUnet');
+  const identity = plan.assets.find((asset) => asset[0] === 'krea2ElementLora');
+  assert.ok(base);
+  assert.equal(base[1], 'diffusion_models');
+  assert.match(base[2], /krea2_turbo_fp8_scaled\.safetensors$/);
+  assert.ok(identity);
+  assert.equal(identity[1], 'loras');
+  assert.equal(identity[3], undefined);
+  assert.match(identity[2], /conradlocke\/krea2-identity-edit\/resolve\/main\/krea2_identity_edit_v1_2_r64\.safetensors$/);
+  assert.deepEqual(COMPONENTS.elements.nodes, ['krea2Edit', 'rebalance']);
+  assert.equal(NODE_PACKS.krea2Edit.enforceRevision, true);
+  assert.match(NODE_PACKS.rebalance.repo, /nova452\/ComfyUI-Conditioning-Rebalance/);
+});
+
+test('Visual Elements readiness maps missing nodes and models back to one installable component', () => {
+  assert.match(server, /elements: \['elements'\]/);
+  assert.match(server, /krea2Elements: \['elements'\]/);
+  assert.match(server, /krea2Elements: \{[\s\S]*?settings\.krea2ElementLora/);
+  assert.match(server, /unet: p\.elementIdentityMode \? settings\.krea2ElementUnet : settings\.unet/);
+  assert.match(server, /krea2ElementUnet: 'krea2_turbo_fp8_scaled\.safetensors'/);
+  assert.match(server, /if \(!String\(s\.krea2ElementUnet \|\| ''\)\.trim\(\)\) s\.krea2ElementUnet = DEFAULT_SETTINGS\.krea2ElementUnet/);
+  assert.match(server, /elements: \['Krea2EditModelPatch',[\s\S]*?'Krea2EditRebalance'/);
 });
 
 test('installed reviewed node packs report stale revisions for every affected workflow', async () => {
@@ -187,7 +219,7 @@ test('installed reviewed node packs report stale revisions for every affected wo
     nodePath,
     currentRef: staleRef,
     expectedRef: NODE_PACKS.krea2Edit.ref,
-    componentIds: ['krea2ref', 'krea2outpaint'],
+    componentIds: ['krea2ref', 'elements', 'krea2outpaint'],
   }]);
 });
 

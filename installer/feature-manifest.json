@@ -68,6 +68,15 @@
       "nodes": ["Krea2EditRebalance", "ComfyUI-Conditioning-Rebalance"]
     },
     {
+      "id": "edit.elements",
+      "label": "Visual Elements",
+      "default": true,
+      "variant": "Krea 2 FP8 or INT8 ConvRot + rank-64 Identity Edit v1.2 LoRA and Conditioning Rebalance references",
+      "hardware": { "minimumVramGb": 8, "recommendedVramGb": 16, "autoSelect": "supported" },
+      "models": ["krea2", "krea2-identity-edit-v1.2-r64-lora"],
+      "nodes": ["Krea2EditModelPatch", "Krea2EditGroundedEncode", "Krea2EditRebalance", "comfyui-krea2edit", "ComfyUI-Conditioning-Rebalance"]
+    },
+    {
       "id": "video.ltx",
       "label": "LTX 2.3 Video + Face ID",
       "default": false,

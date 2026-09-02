@@ -669,6 +669,40 @@ function makePromptReferenceToken(index) {
   return token;
 }
 
+function makePromptElementToken(element, authoredHandle) {
+  const handle = authoredHandle || element.handle;
+  const token = document.createElement('span');
+  token.className = 'prompt-element-token';
+  token.contentEditable = 'false';
+  token.dataset.elementHandle = element.handle;
+  token.dataset.promptValue = handle;
+  token.title = `${element.label || element.handle} · ${element.type || 'element'}`;
+
+  const open = document.createElement('button');
+  open.type = 'button';
+  open.className = 'prompt-element-token-open';
+  open.dataset.openPromptElement = element.id;
+  open.setAttribute('aria-label', `Edit ${element.handle}`);
+  if (element.assetNames?.[0]) {
+    const image = document.createElement('img');
+    image.src = `/api/input?name=${encodeURIComponent(element.assetNames[0])}`;
+    image.alt = '';
+    open.appendChild(image);
+  }
+  const label = document.createElement('b');
+  label.textContent = handle;
+  open.appendChild(label);
+
+  const remove = document.createElement('button');
+  remove.type = 'button';
+  remove.className = 'prompt-ref-remove';
+  remove.dataset.removePromptElement = element.handle;
+  remove.setAttribute('aria-label', `Remove this ${element.handle} from prompt`);
+  remove.textContent = '×';
+  token.append(open, remove);
+  return token;
+}
+
 function makeH3PromptReferenceToken(tag) {
   const entry = h3PromptReferenceEntries().find((candidate) => candidate.tag === tag);
   const token = document.createElement('span');
@@ -1135,6 +1169,14 @@ function escapePromptPattern(value) {
   return String(value || '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
+function caseInsensitivePromptPattern(value) {
+  return [...String(value || '')].map((character) => (
+    /[a-z]/i.test(character)
+      ? `[${character.toLowerCase()}${character.toUpperCase()}]`
+      : escapePromptPattern(character)
+  )).join('');
+}
+
 function renderPromptComposer() {
   const composer = $('#promptComposer');
   if (!composer) return;
@@ -1148,19 +1190,29 @@ function renderPromptComposer() {
     .sort((left, right) => right.length - left.length)
     .map(escapePromptPattern)
     .join('|');
-  const pattern = `(@image-\\d+|<(?:Picture|Video|Audio) \\d+>|@lora-trigger\\[[^\\]]+\\]|@lora-trigger-[^\\s,;:!?]+${presetPattern ? `|${presetPattern}` : ''})`;
+  const elementByHandle = new Map((state.elements || []).map((element) => [element.handle.toLowerCase(), element]));
+  const elementPattern = [...elementByHandle.keys()]
+    .sort((left, right) => right.length - left.length)
+    .map(caseInsensitivePromptPattern)
+    .join('|');
+  const elementAlternative = elementPattern
+    ? `|(?<![a-z0-9_-])(?:${elementPattern})(?![a-z0-9_-])`
+    : '';
+  const pattern = `(@image-\\d+|<(?:Picture|Video|Audio) \\d+>|@lora-trigger\\[[^\\]]+\\]|@lora-trigger-[^\\s,;:!?]+${elementAlternative}${presetPattern ? `|${presetPattern}` : ''})`;
   const parts = value.split(new RegExp(pattern, 'g'));
   composer.replaceChildren();
   parts.forEach((part, index) => {
     const refMatch = /^@image-(\d+)$/.exec(part);
     const h3RefMatch = /^<(?:Picture|Video|Audio) \d+>$/.test(part);
     const loraMatch = /^@lora-trigger(?:\[[^\]]+\]|-[^\s,;:!?]+)$/.test(part);
+    const promptElement = elementByHandle.get(part.toLowerCase());
     const betweenPresets = /^\s*,\s*$/.test(part)
       && presetByValue.has(parts[index - 1])
       && presetByValue.has(parts[index + 1]);
     if (refMatch) composer.appendChild(makePromptReferenceToken(refMatch[1]));
     else if (h3RefMatch && h3ReferenceModeActive()) composer.appendChild(makeH3PromptReferenceToken(part));
     else if (loraMatch) composer.appendChild(makePromptLoraTriggerToken(loraNameFromTriggerToken(part)));
+    else if (promptElement) composer.appendChild(makePromptElementToken(promptElement, part));
     else if (presetByValue.has(part)) composer.appendChild(makePromptPresetToken(presetByValue.get(part)));
     else if (betweenPresets) composer.appendChild(makePromptPresetSeparator(part));
     else if (part) composer.appendChild(document.createTextNode(part));
@@ -1174,6 +1226,7 @@ function composerNodeText(node, root) {
   if (el.classList.contains('prompt-h3-ref-token')) return el.dataset.h3RefTag || '';
   if (el.classList.contains('prompt-ref-token')) return `@image-${el.dataset.refIndex}`;
   if (el.classList.contains('prompt-lora-token')) return loraTriggerToken(el.dataset.loraName);
+  if (el.classList.contains('prompt-element-token')) return el.dataset.promptValue || el.dataset.elementHandle || '';
   if (el.classList.contains('prompt-preset-token')) return el.dataset.promptValue || el.textContent || '';
   if (el.classList.contains('prompt-preset-separator')) return el.dataset.promptValue || ', ';
   if (el.tagName === 'BR') return '\n';
@@ -1190,6 +1243,7 @@ function setPromptDraft(value, { render = true } = {}) {
   $('#prompt').value = value || '';
   if (render) renderPromptComposer();
   renderPromptElements();
+  renderKrea2Mode();
   if ($('#editSequenceBtn')) renderEditSequence();
   renderH3PromptGuideTrigger();
   if ($('#vidH3ReplacePanel')) renderH3Replacement();
@@ -1264,6 +1318,27 @@ function insertPromptPlainText(text, preferredRange = null) {
   promptSelectionRange = caret.cloneRange();
   syncPromptDraftFromComposer();
   return caret;
+}
+
+function insertPromptElement(element, preferredRange = null) {
+  if (!element?.handle) return;
+  const composer = $('#promptComposer');
+  composer.focus({ preventScroll: true });
+  const selection = window.getSelection();
+  const range = promptComposerRange(preferredRange);
+  selection.removeAllRanges();
+  selection.addRange(range);
+  range.deleteContents();
+  const leading = promptRangeNeedsSeparator(range, composer) ? document.createTextNode(' ') : null;
+  const token = makePromptElementToken(element, element.handle);
+  const space = document.createTextNode(' ');
+  const fragment = document.createDocumentFragment();
+  if (leading) fragment.appendChild(leading);
+  fragment.append(token, space);
+  range.insertNode(fragment);
+  placePromptCaretAfter(space);
+  promptSelectionRange = null;
+  syncPromptDraftFromComposer();
 }
 
 function promptRangeNeedsSeparator(range, composer) {
@@ -1373,7 +1448,7 @@ function renderPromptMentionPicker() {
       option.append(media, copy, add);
       option.addEventListener('click', () => {
         $('#promptMentionSheet').classList.remove('show');
-        insertPromptPlainText(`${element.handle} `);
+        insertPromptElement(element);
         promptMentionTargetToken = null;
         saveForm();
       });
@@ -1439,6 +1514,17 @@ function renderPromptMentionPicker() {
     });
     list.appendChild(option);
   });
+  if (!h3Reference) {
+    const literal = document.createElement('button');
+    literal.type = 'button';
+    literal.className = 'prompt-mention-option prompt-mention-literal';
+    literal.innerHTML = '<span aria-hidden="true">@</span><span><b>Type a different @name</b><small>Insert plain text instead of a saved Element</small></span><i>→</i>';
+    literal.addEventListener('click', () => {
+      $('#promptMentionSheet').classList.remove('show');
+      insertPromptPlainText('@');
+    });
+    list.appendChild(literal);
+  }
 }
 
 function openPromptMentionPicker() {
@@ -8173,6 +8259,34 @@ function renderKrea2Mode() {
     detachKrea2RawTurboLora();
     return;
   }
+  const activeElements = (state.elements || []).filter((element) => promptMentionsElement(element.handle));
+  const activeElement = activeElements.find((element) => element.type === 'character') || activeElements[0];
+  const elementMode = activeElement
+    ? (activeElements.some((element) => element.type === 'character') ? 'identity' : 'reference')
+    : '';
+  const modelLabel = button.querySelector('b');
+  button.disabled = !!elementMode;
+  button.classList.toggle('is-element-model', !!elementMode);
+  button.title = elementMode
+    ? `${activeElement.type[0].toUpperCase()}${activeElement.type.slice(1)} Elements choose their compatible model automatically.`
+    : '';
+  if (elementMode) {
+    detachKrea2RawTurboLora();
+    const status = elementMode === 'identity'
+      ? lastMeta?.models?.krea2Elements?.unet
+      : lastMeta?.models?.krea2?.turbo;
+    const rawName = String(status?.name || 'Krea 2');
+    const modelName = /homofidelis/i.test(rawName)
+      ? `HomoFidelis Krea 2${/bf16/i.test(rawName) ? ' BF16' : ''}`
+      : (/krea2?_turbo/i.test(rawName) ? 'Stock Krea 2' : rawName.replace(/\.safetensors$/i, ''));
+    if (modelLabel) modelLabel.textContent = `${activeElement.type[0].toUpperCase()}${activeElement.type.slice(1)} Element`;
+    $('#kreaModelSummary').textContent = status?.ok === false
+      ? `${modelName} · model missing`
+      : `${modelName} · ${elementMode} · ${Number($('#stepsInput').value) || state.userDefaults.create.steps} steps`;
+    button.setAttribute('aria-checked', 'true');
+    return;
+  }
+  if (modelLabel) modelLabel.textContent = 'Turbo';
   if (state.krea2Turbo) {
     detachKrea2RawTurboLora();
   }
@@ -8319,6 +8433,7 @@ function managedLoraChanged(lora) {
 }
 
 $('#kreaTurboToggle').addEventListener('click', () => {
+  if ($('#kreaTurboToggle').disabled) return;
   const nextTurbo = !state.krea2Turbo;
   const rawStatus = lastMeta && lastMeta.models && lastMeta.models.krea2 && lastMeta.models.krea2.raw;
   state.krea2Turbo = nextTurbo;
@@ -12478,7 +12593,21 @@ function updatePromptClear() {
 
 function promptMentionsElement(handle) {
   const escaped = String(handle || '').replace(/^@/, '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-  return escaped && new RegExp(`(^|[^a-z0-9_-])@${escaped}\\b`, 'i').test(promptDraft());
+  return escaped && new RegExp(`(^|[^a-z0-9_-])@${escaped}(?![a-z0-9_-])`, 'i').test(promptDraft());
+}
+
+function removePromptElement(handle) {
+  const escaped = String(handle || '').replace(/^@/, '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  if (!escaped) return;
+  const next = promptDraft()
+    .replace(new RegExp(`(^|[^a-z0-9_-])@${escaped}(?![a-z0-9_-])`, 'gi'), '$1')
+    .replace(/[ \t]{2,}/g, ' ')
+    .replace(/ +([,.;!?])/g, '$1')
+    .trim();
+  setPromptDraft(next);
+  state.prompts[state.view] = promptDraft();
+  saveForm();
+  $('#promptComposer').focus({ preventScroll: true });
 }
 
 function renderPromptElements() {
@@ -12489,11 +12618,13 @@ function renderPromptElements() {
   list.replaceChildren();
   for (const element of state.elements || []) {
     const mentioned = promptMentionsElement(element.handle);
+    const chip = document.createElement('span');
+    chip.className = 'prompt-element-chip' + (mentioned ? ' is-mentioned' : '');
     const button = document.createElement('button');
     button.type = 'button';
-    button.className = 'prompt-element-chip' + (mentioned ? ' is-mentioned' : '');
+    button.className = 'prompt-element-open';
     button.setAttribute('aria-pressed', String(mentioned));
-    button.title = mentioned ? `Edit ${element.handle}` : `Add ${element.handle} to prompt`;
+    button.title = mentioned ? `Remove all ${element.handle} mentions from prompt` : `Add ${element.handle} to prompt`;
     const image = document.createElement('img');
     image.src = `/api/input?name=${encodeURIComponent(element.assetNames[0])}`;
     image.alt = '';
@@ -12501,18 +12632,49 @@ function renderPromptElements() {
     label.textContent = element.handle;
     button.append(image, label);
     button.addEventListener('click', () => {
-      if (promptMentionsElement(element.handle)) return openElementEditor({ element });
+      if (promptMentionsElement(element.handle)) return removePromptElement(element.handle);
       const before = promptDraft();
       setPromptDraft(`${before}${before && !/\s$/.test(before) ? ' ' : ''}${element.handle} `);
       state.prompts[state.view] = promptDraft();
       saveForm();
       $('#promptComposer').focus();
     });
-    list.appendChild(button);
+    chip.appendChild(button);
+    const edit = document.createElement('button');
+    edit.type = 'button';
+    edit.className = 'prompt-element-edit';
+    edit.dataset.editPromptElement = element.id;
+    edit.setAttribute('aria-label', `Edit ${element.handle}`);
+    edit.title = `Edit ${element.handle}`;
+    edit.textContent = '✎';
+    edit.addEventListener('click', () => openElementEditor({ element, trigger: edit }));
+    chip.appendChild(edit);
+    if (mentioned) {
+      const remove = document.createElement('button');
+      remove.type = 'button';
+      remove.className = 'prompt-element-remove';
+      remove.setAttribute('aria-label', `Remove all ${element.handle} mentions from prompt`);
+      remove.title = `Remove all ${element.handle} mentions from prompt`;
+      remove.textContent = '×';
+      remove.addEventListener('click', (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        removePromptElement(element.handle);
+      });
+      chip.appendChild(remove);
+    }
+    list.appendChild(chip);
   }
 }
+
+function refreshElementsUi({ forceComposer = false } = {}) {
+  const composer = $('#promptComposer');
+  if (forceComposer || document.activeElement !== composer) renderPromptComposer();
+  renderPromptElements();
+  renderKrea2Mode();
+}
 $('#promptComposer').addEventListener('beforeinput', (event) => {
-  if ((state.view === 'edit' || h3ReferenceModeActive()) && event.inputType === 'insertText' && event.data === '@') {
+  if ((state.view !== 'video' || h3ReferenceModeActive()) && event.inputType === 'insertText' && event.data === '@') {
     event.preventDefault();
     openPromptMentionPicker();
   }
@@ -12522,8 +12684,14 @@ $('#promptComposer').addEventListener('input', syncPromptDraftFromComposer);
 $('#promptComposer').addEventListener('keyup', capturePromptSelection);
 $('#promptComposer').addEventListener('mouseup', capturePromptSelection);
 $('#promptComposer').addEventListener('click', (event) => {
-  const remove = event.target.closest('[data-remove-prompt-ref], [data-remove-prompt-lora], [data-remove-prompt-preset]');
+  const remove = event.target.closest('[data-remove-prompt-ref], [data-remove-prompt-lora], [data-remove-prompt-preset], [data-remove-prompt-element]');
   if (!remove) {
+    const openElement = event.target.closest('[data-open-prompt-element]');
+    if (openElement) {
+      const element = (state.elements || []).find((candidate) => candidate.id === openElement.dataset.openPromptElement);
+      if (element) openElementEditor({ element, trigger: openElement });
+      return;
+    }
     const openH3Reference = event.target.closest('[data-open-h3-prompt-ref]');
     const h3Token = openH3Reference?.closest('.prompt-h3-ref-token');
     if (h3Token) {
@@ -12541,7 +12709,7 @@ $('#promptComposer').addEventListener('click', (event) => {
     }
     return;
   }
-  const token = remove.closest('.prompt-ref-token, .prompt-lora-token, .prompt-preset-token');
+  const token = remove.closest('.prompt-ref-token, .prompt-lora-token, .prompt-preset-token, .prompt-element-token');
   if (token.classList.contains('prompt-preset-token')) {
     const separator = token.previousElementSibling?.classList.contains('prompt-preset-separator')
       ? token.previousElementSibling
@@ -19195,6 +19363,7 @@ function galleryImageDestinationActions(item, { includeReuse = true } = {}) {
 
 let elementEditor = null;
 let elementPreviewUrl = '';
+let elementEditorTrigger = null;
 
 function elementHandleSuggestion(value) {
   return String(value || '').toLowerCase().replace(/^@+/, '').replace(/[^a-z0-9_-]+/g, '-').replace(/^-+|-+$/g, '').replace(/^[^a-z]+/, '').slice(0, 48) || 'new-element';
@@ -19209,19 +19378,22 @@ function setElementEditorType(type) {
   try { localStorage.setItem('mix-last-element-type', chosen); } catch { /* optional preference */ }
 }
 
-function closeElementEditor() {
+function closeElementEditor(restoreFocus = true) {
   $('#elementSheet').classList.remove('show');
   if (elementPreviewUrl) URL.revokeObjectURL(elementPreviewUrl);
   elementPreviewUrl = '';
   elementEditor = null;
   syncSheetScrollLock();
+  if (restoreFocus && elementEditorTrigger?.isConnected) elementEditorTrigger.focus({ preventScroll: true });
+  elementEditorTrigger = null;
 }
 
-function openElementEditor({ element = null, item = null } = {}) {
+function openElementEditor({ element = null, item = null, trigger = null } = {}) {
   if (elementPreviewUrl) URL.revokeObjectURL(elementPreviewUrl);
   elementPreviewUrl = '';
   let rememberedType = 'character';
   try { rememberedType = localStorage.getItem('mix-last-element-type') || rememberedType; } catch { /* optional preference */ }
+  elementEditorTrigger = trigger || document.activeElement;
   elementEditor = { element, item, file: null, type: element?.type || rememberedType };
   $('#elementImageInput').value = '';
   $('#elementSheetTitle').textContent = element ? `Edit ${element.handle}` : 'New Element';
@@ -19262,7 +19434,7 @@ $('#elementImageInput').addEventListener('change', () => {
   if ($('#elementHandle').value === 'new-element') $('#elementHandle').value = elementHandleSuggestion(file.name.replace(/\.[^.]+$/, ''));
   $('#elementHandle').select();
 });
-$('#elementSheet [data-close]').addEventListener('click', closeElementEditor);
+$('#elementSheet [data-close]').addEventListener('click', () => closeElementEditor());
 $('#elementForm').addEventListener('submit', async (event) => {
   event.preventDefault();
   if (!elementEditor) return;
@@ -19285,8 +19457,10 @@ $('#elementForm').addEventListener('submit', async (event) => {
       }),
     });
     state.elements = [result.element, ...state.elements.filter((entry) => entry.id !== result.element.id)];
-    closeElementEditor();
-    renderPromptElements();
+    closeElementEditor(false);
+    refreshElementsUi({ forceComposer: true });
+    requestAnimationFrame(() => [...document.querySelectorAll('[data-edit-prompt-element]')]
+      .find((button) => button.dataset.editPromptElement === result.element.id)?.focus({ preventScroll: true }));
     toast(`${result.element.handle} is ready to use`);
   } catch (error) { toast(error.message, true); }
   finally { save.disabled = false; }
@@ -19297,8 +19471,9 @@ $('#elementDeleteBtn').addEventListener('click', async () => {
   try {
     await api(`/api/elements/${encodeURIComponent(element.id)}`, { method: 'DELETE' });
     state.elements = state.elements.filter((entry) => entry.id !== element.id);
-    closeElementEditor();
-    renderPromptElements();
+    closeElementEditor(false);
+    refreshElementsUi({ forceComposer: true });
+    requestAnimationFrame(() => $('#elementAddBtn').focus({ preventScroll: true }));
     toast(`${element.handle} deleted`);
   } catch (error) { toast(error.message, true); }
 });
@@ -21871,9 +22046,9 @@ $('#generateBtn').addEventListener('click', async () => {
   } catch (e) {
     setGenerating(false);
     if (!firstImageTutorialJobId) retryFirstImageTutorialGeneration();
-    if (e.code === 'comfy_int8_update_required' || e.code === 'comfy_krea2_update_required') {
+    if (e.code === 'comfy_int8_update_required' || e.code === 'comfy_krea2_update_required' || e.code === 'element_reference_nodes_missing') {
       await openInitialSetup({
-        components: generationSetupComponents(),
+        components: e.code === 'element_reference_nodes_missing' ? ['elements'] : generationSetupComponents(),
         message: e.message,
       });
     } else if (!isJobCancellation(e)) toast(e.message, true);
@@ -22841,7 +23016,7 @@ function refreshGallery(soft, options = {}) {
       void refreshLoraContext();
       renderFolders();
       renderGrid();
-      renderPromptElements();
+      refreshElementsUi();
       renderDesktopStage();
       updatePrivacyButton();
     } catch (e) {
@@ -36414,10 +36589,10 @@ let setupHfTokenFeedback = '';
 let setupHfTokenFeedbackKind = '';
 const setupConfirmedDifficultComponents = new Set();
 const SETUP_STEPS = ['connect', 'install', 'finish'];
-const KREA2_MODEL_COMPONENTS = new Set(['image', 'krea2raw', 'regional', 'krea2ref', 'krea2remix', 'krea2outpaint', 'krea2depth', 'krea2style']);
+const KREA2_MODEL_COMPONENTS = new Set(['image', 'krea2raw', 'regional', 'krea2ref', 'krea2remix', 'krea2outpaint', 'krea2depth', 'krea2style', 'elements']);
 const SETUP_COMPONENT_CATEGORIES = [
   { id: 'image', label: 'Image', description: 'Generation, regional control, guides, and upscaling', components: ['image', 'krea2raw', 'regional', 'krea2depth', 'krea2style', 'upscale', 'ultimateupscale'] },
-  { id: 'edit', label: 'Edit', description: 'Klein, Qwen, Krea editing, masks, and outpainting', components: ['klein4', 'klein9', 'qwen', 'krea2ref', 'krea2remix', 'krea2outpaint', 'editoutpaint', 'smartmask'] },
+  { id: 'edit', label: 'Edit', description: 'Klein, Qwen, Krea editing, Elements, masks, and outpainting', components: ['klein4', 'klein9', 'qwen', 'krea2ref', 'krea2remix', 'elements', 'krea2outpaint', 'editoutpaint', 'smartmask'] },
   { id: 'video', label: 'Video', description: 'MiniMax H3, LTX, Wan, SCAIL, Director, Face ID, and video tools', components: ['h3', 'h3turbo', 'h3turbor2v', 'h3context', 'h3sage', 'h3r2v', 'ltx25', 'ltx25quality', 'video', 'ltxdirector', 'ltxcamera', 'videoedit', 'faceid', 'eros', 'wan', 'wananimate2', 'scail', 'scailinfinity', 'video4k'] },
 ];
 
