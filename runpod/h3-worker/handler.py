@@ -127,6 +127,8 @@ def handler(job):
     ready = readiness()
     if not ready["ready"]:
         raise RuntimeError("H3 worker is missing nodes: " + ", ".join(ready["missingNodes"]))
+    if request.get("probe") is True:
+        return {"refresh_worker": True, **ready}
     try:
         runpod.serverless.progress_update(job, "Preparing H3 inputs…")
         download_inputs(request.get("inputs"))
