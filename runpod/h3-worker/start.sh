@@ -56,7 +56,7 @@ cleanup() { kill "$COMFY_PID" 2>/dev/null || true; }
 trap cleanup EXIT INT TERM
 
 for _ in $(seq 1 180); do
-  if curl -fsS http://127.0.0.1:8188/object_info >/dev/null; then
+  if python -c 'import urllib.request; urllib.request.urlopen("http://127.0.0.1:8188/object_info", timeout=2).read(1)' >/dev/null 2>&1; then
     exec python /mix-h3/handler.py
   fi
   if ! kill -0 "$COMFY_PID" 2>/dev/null; then
