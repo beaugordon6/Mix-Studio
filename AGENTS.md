@@ -2,6 +2,23 @@
 
 Handbook for AI agents (and humans) continuing development. Read this before touching anything. The app is in daily production use by Nathan (Black Mixture) — his real gallery lives in `data/`.
 
+## Backlog coordination — mandatory for every Codex task
+
+`BACKLOG.md` is the shared source of truth for planned, active, blocked, and completed development work. Every Codex task working on Mix Studio must read it before making changes.
+
+1. Search `BACKLOG.md` for an existing matching item before adding a duplicate.
+2. If no matching item exists, add one with the next permanent `MIX-NNN` ID, a summary, requirements, and testable acceptance criteria.
+3. Before implementation, move the item to **Claimed** and record the task title or branch plus an ISO-8601 claim timestamp.
+4. Never work on an item claimed by another active task. Coordinate a handoff and record it on the item before taking over.
+5. Re-read the item immediately before editing because another task may have changed its status or scope.
+6. Keep discoveries, scope changes, handoffs, and blockers in the item's Notes. Move blocked work to **Blocked** with the condition required to resume it.
+7. Mark work **Completed** only after every acceptance criterion passes. Check the boxes, record the exact verification commands and results, add the completion timestamp, and move the intact item to the completed archive.
+8. If a task stops unfinished, return the item to **Ready** or mark it **Blocked**. Never leave an abandoned claim.
+9. Claims older than 24 hours are not automatically available. Inspect the prior task and repository state, then record an explicit takeover or handoff.
+10. Read-only questions and diagnostics must still consult the backlog and add useful findings to the matching item, but they claim an item only when implementation begins.
+
+Review backlog state with code changes. A feature is not complete merely because code exists; its backlog acceptance and verification record must agree.
+
 ## What this is
 
 A zero-dependency Node.js (≥22) server (`server.js`) that builds **ComfyUI API-format graphs** server-side and relays progress to a vanilla-JS mobile frontend (`public/`). No npm packages, no build step, no framework. ComfyUI runs on the same Windows machine (URL in `data/settings.json`, `comfyUrl`).
