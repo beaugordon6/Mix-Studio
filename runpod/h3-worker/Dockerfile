@@ -1,4 +1,4 @@
-ARG WORKER_BASE=runpod/worker-comfyui:5.8.6-base
+ARG WORKER_BASE=runpod/worker-comfyui:5.8.6-base-cuda12.8.1
 FROM ${WORKER_BASE}
 
 COPY requirements.txt /tmp/mix-h3-requirements.txt
