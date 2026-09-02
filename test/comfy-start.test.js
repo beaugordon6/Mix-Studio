@@ -177,6 +177,22 @@ test('restart never kills a port listener that is not the configured ComfyUI pro
   }
 });
 
+test('relative main.py is trusted only when the process cwd is the configured ComfyUI folder', () => {
+  const status = {
+    basePath: '/Users/mix/ComfyUI',
+    mainPy: '/Users/mix/ComfyUI/main.py',
+    pythonPath: '/Users/mix/ComfyUI/.venv/bin/python',
+  };
+  assert.equal(isExpectedComfyProcess({
+    CommandLine: 'Python main.py --port 8188',
+    WorkingDirectory: '/Users/mix/ComfyUI',
+  }, status, { platform: 'darwin', pathApi: path.posix }), true);
+  assert.equal(isExpectedComfyProcess({
+    CommandLine: 'Python main.py --port 8188',
+    WorkingDirectory: '/Users/other/project',
+  }, status, { platform: 'darwin', pathApi: path.posix }), false);
+});
+
 test('restart kills only a verified ComfyUI listener before relaunching portable ComfyUI', async () => {
   const temp = fs.mkdtempSync(path.join(os.tmpdir(), 'mix-comfy-restart-verified-'));
   const base = path.join(temp, 'ComfyUI');
@@ -224,6 +240,7 @@ test('macOS restart sends TERM only to the verified source ComfyUI listener', as
       platform: 'darwin', env: {}, home: path.join(temp, 'missing'), fsImpl: fs,
       run: async (command, args) => {
         calls.push([command, args]);
+        if (command === '/usr/sbin/lsof' && args.includes('-d')) return `p77\nfcwd\nn${base}\n`;
         if (command === '/usr/sbin/lsof') return listenerChecks++ === 0 ? '77\n' : '';
         if (command === '/bin/ps') return `77 ${python} ${mainPy} --port 8188`;
         return '';

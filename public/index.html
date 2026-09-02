@@ -2054,42 +2054,42 @@
     <h3 class="sheet-title">Upscale image <button data-close type="button" aria-label="Close upscale settings">✕</button></h3>
     <div class="field"><label>Engine</label></div>
     <div class="chip-row" id="upEngineChips">
-      <button class="chip active" data-engine="seedvr2">SeedVR2</button>
-      <button class="chip" data-engine="ultimate">Ultimate SD</button>
+      <button class="chip active" data-engine="seedvr2" aria-label="SeedVR2: AI detail reconstruction" data-icon-tooltip="SeedVR2" data-icon-tooltip-detail="Reconstructs detail with a dedicated AI upscaler. It can look sharper, but may invent texture that was not in the original.">SeedVR2</button>
+      <button class="chip" data-engine="ultimate" aria-label="Ultimate SD: prompt-guided Krea 2 tile refinement" data-icon-tooltip="Ultimate SD" data-icon-tooltip-detail="Upscales first, then refines overlapping tiles with Krea 2 at low denoise. It follows the image prompt and usually preserves the original structure better.">Ultimate SD</button>
     </div>
     <div class="field" id="upModeField"><label>Mode</label></div>
     <div class="chip-row" id="upModeChips">
-      <button class="chip active" data-mode="resolution">Target</button>
-      <button class="chip" data-mode="scale">Multiplier</button>
+      <button class="chip active" data-mode="resolution" aria-label="Target: choose the final short-side resolution" data-icon-tooltip="Target" data-icon-tooltip-detail="Sets the final image size by its shorter side. The longer side follows the original aspect ratio.">Target</button>
+      <button class="chip" data-mode="scale" aria-label="Multiplier: scale both dimensions proportionally" data-icon-tooltip="Multiplier" data-icon-tooltip-detail="Multiplies both source dimensions. For example, 2× turns 1024 × 768 into approximately 2048 × 1536.">Multiplier</button>
     </div>
     <div class="field" id="upTargetField"><label>Target resolution (short side)</label></div>
     <div class="chip-row" id="upResChips">
-      <button class="chip" data-res="1080">1080</button>
-      <button class="chip" data-res="1440">1440</button>
-      <button class="chip active" data-res="2160">2160</button>
+      <button class="chip" data-res="1080" aria-label="1080 pixels on the short side" data-icon-tooltip="1080" data-icon-tooltip-detail="Makes the shorter side 1080 pixels. Fastest and least likely to exaggerate fine texture.">1080</button>
+      <button class="chip" data-res="1440" aria-label="1440 pixels on the short side" data-icon-tooltip="1440" data-icon-tooltip-detail="Makes the shorter side 1440 pixels. A middle ground between speed and output size.">1440</button>
+      <button class="chip active" data-res="2160" aria-label="2160 pixels on the short side" data-icon-tooltip="2160" data-icon-tooltip-detail="Makes the shorter side 2160 pixels. Largest target here; it takes more time and may create more synthetic detail.">2160</button>
     </div>
     <div class="field" id="upScaleField" hidden><label>Upscale multiplier</label></div>
     <div class="chip-row" id="upScaleChips" hidden>
-      <button class="chip" data-scale="1.5">1.5×</button>
-      <button class="chip active" data-scale="2">2×</button>
-      <button class="chip" data-scale="3">3×</button>
-      <button class="chip" data-scale="4">4×</button>
+      <button class="chip" data-scale="1.5" aria-label="Scale width and height by 1.5" data-icon-tooltip="1.5×" data-icon-tooltip-detail="Increases both dimensions by 50%. A restrained size increase with lower processing cost.">1.5×</button>
+      <button class="chip active" data-scale="2" aria-label="Scale width and height by 2" data-icon-tooltip="2×" data-icon-tooltip-detail="Doubles both dimensions, producing four times as many total pixels.">2×</button>
+      <button class="chip" data-scale="3" aria-label="Scale width and height by 3" data-icon-tooltip="3×" data-icon-tooltip-detail="Triples both dimensions, producing nine times as many total pixels. Slower and more memory-intensive.">3×</button>
+      <button class="chip" data-scale="4" aria-label="Scale width and height by 4" data-icon-tooltip="4×" data-icon-tooltip-detail="Quadruples both dimensions, producing sixteen times as many total pixels. Use only when you need a very large file.">4×</button>
     </div>
     <div class="field" id="upProfileField"><label>Detail profile</label></div>
     <div class="chip-row" id="upProfileChips">
-      <button class="chip active" data-profile="sharp">Sharp</button>
-      <button class="chip" data-profile="balanced">Balanced</button>
+      <button class="chip active" data-profile="sharp" aria-label="Sharp detail profile" data-icon-tooltip="Sharp" data-icon-tooltip-detail="Uses the sharper SeedVR2 model when installed and stronger wavelet color correction. More crisp, with a higher risk of artificial-looking texture.">Sharp</button>
+      <button class="chip" data-profile="balanced" aria-label="Balanced detail profile" data-icon-tooltip="Balanced" data-icon-tooltip-detail="Uses the standard SeedVR2 model with gentler color correction for a more restrained, faithful result.">Balanced</button>
     </div>
     <div class="field" id="upNoiseField"><label>Detail noise</label></div>
     <div class="chip-row" id="upNoiseChips">
-      <button class="chip" data-noise="off">Off</button>
-      <button class="chip active" data-noise="low">Low</button>
-      <button class="chip" data-noise="medium">Medium</button>
+      <button class="chip" data-noise="off" aria-label="Detail noise off" data-icon-tooltip="Off" data-icon-tooltip-detail="Adds no input noise. Best for preserving the source, but it may restore less fine detail.">Off</button>
+      <button class="chip active" data-noise="low" aria-label="Low detail noise" data-icon-tooltip="Low" data-icon-tooltip-detail="Adds a small amount of noise to encourage fine detail. This is the restrained default.">Low</button>
+      <button class="chip" data-noise="medium" aria-label="Medium detail noise" data-icon-tooltip="Medium" data-icon-tooltip-detail="Adds more noise so SeedVR2 can reconstruct more texture. It also increases the chance of invented or fake-looking detail.">Medium</button>
     </div>
     <div class="field" id="upPreField"><label>Pre-resize (lanczos, before SeedVR2)</label></div>
     <div class="chip-row" id="upPreChips">
-      <button class="chip active" data-pre="1">Off</button>
-      <button class="chip" data-pre="2">2×</button>
+      <button class="chip active" data-pre="1" aria-label="Do not pre-resize" data-icon-tooltip="Off" data-icon-tooltip-detail="Sends the original image directly to SeedVR2. This avoids an extra conventional resize step.">Off</button>
+      <button class="chip" data-pre="2" aria-label="Pre-resize with Lanczos by 2" data-icon-tooltip="2× pre-resize" data-icon-tooltip-detail="First doubles the image with conventional Lanczos resizing, then runs SeedVR2. This can reduce how much new structure the AI must invent, but costs more memory.">2×</button>
     </div>
     <div class="field" id="upUltimatePromptField" hidden>
       <label>Prompt (optional)</label>

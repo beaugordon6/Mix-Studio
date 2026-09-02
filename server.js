@@ -4473,6 +4473,7 @@ async function prepareOutpaintParams(p, refNames, info) {
     p.editOutpaintRefine = plan.needsRefine;
     p.editOutpaintRefineProfile = p.postUpscale?.profile || 'balanced';
     p.editOutpaintRefineNoise = p.postUpscale?.noise || 'low';
+    p.gpuVendor = setupHardwareProfile(await getSetupHardwareInfo()).gpuVendor;
     p.seedVr2Models = refine.models;
     // Preserve is completed inside the outpaint graph after the automatic
     // detail upscale. A later whole-image upscale would resample the native

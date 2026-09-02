@@ -132,6 +132,7 @@ test('Krea 2 outpaint follows the grounded identity-edit workflow', () => {
     editOutpaintRefine: true,
     editOutpaintRefineProfile: 'balanced',
     editOutpaintRefineNoise: 'low',
+    gpuVendor: 'apple',
     seedVr2Models: ['seedvr2.safetensors'],
     composite: true,
     prompt: 'Continue the room naturally into the new space.',
@@ -140,6 +141,11 @@ test('Krea 2 outpaint follows the grounded identity-edit workflow', () => {
     loras: [{ name: 'style.safetensors', strength: 0.7, on: true }],
   });
   assert.equal(graph.identity_lora.class_type, 'LoraLoaderModelOnly');
+  assert.equal(graph.outpaint_refine_dit.inputs.device, 'mps');
+  assert.equal(graph.outpaint_refine_dit.inputs.offload_device, 'mps');
+  assert.equal(graph.outpaint_refine_vae.inputs.device, 'mps');
+  assert.equal(graph.outpaint_refine_vae.inputs.offload_device, 'mps');
+  assert.equal(graph.outpaint_refine.inputs.offload_device, 'mps');
   assert.equal(graph.identity_lora.inputs.strength_model, 1);
   assert.equal(graph.padded.class_type, 'ImagePadForOutpaint');
   assert.equal(graph.padded.inputs.right, 220);

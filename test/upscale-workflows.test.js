@@ -11,6 +11,8 @@ const {
   seedVr2Profile,
   seedVr2DitInputs,
   seedVr2AttentionForVendor,
+  seedVr2DeviceForVendor,
+  seedVr2OffloadDeviceForVendor,
   targetResolutionForUpscale,
   rtxVideoSuperResolutionNode,
   seedVr2UpscaleNodes,
@@ -49,6 +51,34 @@ test('CUDA-only SeedVR2 attention falls back to SDPA on non-NVIDIA backends', ()
     seedvr2Attention: 'flash_attn_2',
     gpuVendor: 'amd',
   }).attention_mode, 'sdpa');
+});
+
+test('SeedVR2 loaders select the native Apple MPS device instead of CUDA', () => {
+  assert.equal(seedVr2DeviceForVendor('apple'), 'mps');
+  assert.equal(seedVr2OffloadDeviceForVendor('apple'), 'mps');
+  assert.equal(seedVr2DeviceForVendor('nvidia'), 'cuda:0');
+  assert.equal(seedVr2OffloadDeviceForVendor('nvidia'), 'cpu');
+  assert.equal(seedVr2DeviceForVendor('amd'), 'cuda:0');
+  assert.equal(seedVr2DitInputs({
+    seedvr2Dit: DEFAULT_SEEDVR2_DIT,
+    seedvr2Attention: 'sdpa',
+    gpuVendor: 'apple',
+  }).device, 'mps');
+
+  const result = seedVr2UpscaleNodes(['src', 0], {
+    settings: {
+      seedvr2Dit: DEFAULT_SEEDVR2_DIT,
+      seedvr2Vae: 'ema_vae_fp16.safetensors',
+      seedvr2Attention: 'sdpa',
+    },
+    availableModels: [DEFAULT_SEEDVR2_DIT],
+    gpuVendor: 'apple',
+  });
+  assert.equal(result.nodes.dit.inputs.device, 'mps');
+  assert.equal(result.nodes.dit.inputs.offload_device, 'mps');
+  assert.equal(result.nodes.svvae.inputs.device, 'mps');
+  assert.equal(result.nodes.svvae.inputs.offload_device, 'mps');
+  assert.equal(result.nodes.upscale.inputs.offload_device, 'mps');
 });
 
 test('sharp SeedVR2 profile prefers the sharp 7B model and low detail noise by default', () => {

@@ -165,6 +165,14 @@ test('dependency catalog covers every enabled image and video family', () => {
   assert.match(MODEL_ASSETS.klein9.find((asset) => asset[0] === 'klein9ConsistencyLora')[2], /f2k_9B_lcs_consist_20260415\.safetensors/);
 });
 
+test('Ultimate SD Upscale installs the image upscaler model used by its graph', () => {
+  const plan = dependencyModelPlan(COMPONENTS.ultimateupscale.models, {});
+  assert.deepEqual(plan.assets.map((asset) => asset.slice(0, 2)), [
+    ['ultimateUpscaleModel', 'upscale_models'],
+  ]);
+  assert.match(plan.assets[0][2], /4x_foolhardy_Remacri\.pth$/);
+});
+
 test('installed reviewed node packs report stale revisions for every affected workflow', async () => {
   const customNodesPath = path.join('/comfy', 'custom_nodes');
   const nodePath = path.join(customNodesPath, NODE_PACKS.krea2Edit.folder);

@@ -87,6 +87,19 @@ test('upscale sheet exposes target and multiplier modes', () => {
   assert.match(appJs, /scaleFactor/);
 });
 
+test('every upscale choice explains its effect with a tap and hover tooltip', () => {
+  for (const id of ['upEngineChips', 'upModeChips', 'upResChips', 'upScaleChips', 'upProfileChips', 'upNoiseChips', 'upPreChips']) {
+    const row = indexHtml.match(new RegExp(`<div class="chip-row" id="${id}"[\\s\\S]*?<\\/div>`))?.[0] || '';
+    const buttons = [...row.matchAll(/<button\b[^>]*>/g)].map((match) => match[0]);
+    assert.ok(buttons.length, `${id} should contain choices`);
+    for (const button of buttons) {
+      assert.match(button, /aria-label="[^"]+"/, `${id} choices should have accessible explanations`);
+      assert.match(button, /data-icon-tooltip="[^"]+"/, `${id} choices should opt into tap and hover help`);
+      assert.match(button, /data-icon-tooltip-detail="[^"]+"/, `${id} choices should explain their output effect`);
+    }
+  }
+});
+
 test('create tab exposes image-to-prompt inside the consolidated image tools', () => {
   assert.doesNotMatch(indexHtml, /id="imagePromptBtn"/);
   assert.match(indexHtml, /id="createImageGuideModes"[\s\S]*data-guide-mode="image"[\s\S]*data-guide-mode="depth"[\s\S]*data-guide-mode="style"/);
