@@ -163,7 +163,7 @@ test('dependency catalog covers every enabled image and video family', () => {
   assert.equal(MODEL_ASSETS.krea2ElementIdentity[0][0], 'krea2ElementUnet');
   assert.match(MODEL_ASSETS.krea2ElementIdentity[0][2], /krea2_turbo_fp8_scaled\.safetensors$/);
   assert.equal(MODEL_ASSETS.krea2ElementIdentity[1][0], 'krea2ElementLora');
-  assert.match(MODEL_ASSETS.krea2ElementIdentity[1][2], /krea2_identity_edit_v1_2_r64\.safetensors$/);
+  assert.match(MODEL_ASSETS.krea2ElementIdentity[1][2], /krea2_identity_edit_v1_2\.safetensors$/);
   assert.equal(MODEL_ASSETS.klein4.find((asset) => asset[0] === 'klein4ConsistencyLora')[1], 'loras');
   assert.match(MODEL_ASSETS.klein4.find((asset) => asset[0] === 'klein4Unet')[2], /FLUX\.2-klein-4b-fp8\/resolve\/main\/flux-2-klein-4b-fp8\.safetensors/);
   assert.match(MODEL_ASSETS.klein4.find((asset) => asset[0] === 'klein4ConsistencyLora')[2], /f2k_4B_consist_20260314\.safetensors/);
@@ -189,7 +189,7 @@ test('Visual Elements installs its exact identity LoRA and both conditioning nod
   assert.ok(identity);
   assert.equal(identity[1], 'loras');
   assert.equal(identity[3], undefined);
-  assert.match(identity[2], /conradlocke\/krea2-identity-edit\/resolve\/main\/krea2_identity_edit_v1_2_r64\.safetensors$/);
+  assert.match(identity[2], /conradlocke\/krea2-identity-edit\/resolve\/main\/krea2_identity_edit_v1_2\.safetensors$/);
   assert.deepEqual(COMPONENTS.elements.nodes, ['krea2Edit', 'rebalance']);
   assert.equal(NODE_PACKS.krea2Edit.enforceRevision, true);
   assert.match(NODE_PACKS.rebalance.repo, /nova452\/ComfyUI-Conditioning-Rebalance/);
@@ -202,6 +202,8 @@ test('Visual Elements readiness maps missing nodes and models back to one instal
   assert.match(server, /unet: p\.elementIdentityMode \? settings\.krea2ElementUnet : settings\.unet/);
   assert.match(server, /krea2ElementUnet: 'krea2_turbo_fp8_scaled\.safetensors'/);
   assert.match(server, /if \(!String\(s\.krea2ElementUnet \|\| ''\)\.trim\(\)\) s\.krea2ElementUnet = DEFAULT_SETTINGS\.krea2ElementUnet/);
+  assert.match(server, /krea2ElementLora \|\| ''\)[\s\S]*?krea2_identity_edit_v1_2_r64\.safetensors'[\s\S]*?s\.krea2ElementLora = DEFAULT_SETTINGS\.krea2ElementLora/);
+  assert.match(server, /hadDuplicateElementLora[\s\S]*?stored\.krea2ElementLora = DEFAULT_SETTINGS\.krea2ElementLora[\s\S]*?version < SETTINGS_SCHEMA_VERSION \|\| hadDuplicateElementLora/);
   assert.match(server, /elements: \['Krea2EditModelPatch',[\s\S]*?'Krea2EditRebalance'/);
 });
 
