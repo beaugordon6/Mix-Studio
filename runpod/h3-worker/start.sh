@@ -36,16 +36,18 @@ mix_h3_volume:
 YAML
 
 mkdir -p "$COMFY_DIR/custom_nodes"
-for source in \
-  "$VOLUME_ROOT/custom_nodes/ComfyUI-GGUF" \
-  "$VOLUME_ROOT/custom_nodes/ComfyUI-H3-FaceRefine" \
-  "$VOLUME_ROOT/custom_nodes/Comfyui-Minimax-H3-Promptor" \
-  "$VOLUME_ROOT/custom_nodes/cgem156-ComfyUI" \
-  "$VOLUME_ROOT/runpod-slim/ComfyUI/custom_nodes/ComfyUI-KJNodes"; do
-  if [[ -d "$source" ]]; then
-    ln -sfn "$source" "$COMFY_DIR/custom_nodes/$(basename "$source")"
-  fi
-done
+if [[ "${MIX_H3_VOLUME_CUSTOM_NODES:-0}" == "1" ]]; then
+  for source in \
+    "$VOLUME_ROOT/custom_nodes/ComfyUI-GGUF" \
+    "$VOLUME_ROOT/custom_nodes/ComfyUI-H3-FaceRefine" \
+    "$VOLUME_ROOT/custom_nodes/Comfyui-Minimax-H3-Promptor" \
+    "$VOLUME_ROOT/custom_nodes/cgem156-ComfyUI" \
+    "$VOLUME_ROOT/runpod-slim/ComfyUI/custom_nodes/ComfyUI-KJNodes"; do
+    if [[ -d "$source" ]]; then
+      ln -sfn "$source" "$COMFY_DIR/custom_nodes/$(basename "$source")"
+    fi
+  done
+fi
 
 cd "$COMFY_DIR"
 python main.py --listen 127.0.0.1 --port 8188 --disable-auto-launch --extra-model-paths-config extra_model_paths.yaml &
