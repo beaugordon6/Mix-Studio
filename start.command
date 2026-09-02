@@ -26,6 +26,13 @@ fi
 
 export MIXBOX_RESTART_MODE=launcher
 export PYTORCH_ENABLE_MPS_FALLBACK="${PYTORCH_ENABLE_MPS_FALLBACK:-1}"
+export ASFP8_ENABLE_ONLY="${ASFP8_ENABLE_ONLY:-int8_linear_kernel_mps,fused_norm_mps,rope_fast_mps}"
+export APPLESILICON_FP8_MPS_WATERMARK="${APPLESILICON_FP8_MPS_WATERMARK:-off}"
+# Comfy Desktop is a separate GUI process, so exporting only into Mix Studio's
+# child process is insufficient. Prime the per-user GUI launch environment.
+/bin/launchctl setenv PYTORCH_ENABLE_MPS_FALLBACK "$PYTORCH_ENABLE_MPS_FALLBACK" >/dev/null 2>&1 || true
+/bin/launchctl setenv ASFP8_ENABLE_ONLY "$ASFP8_ENABLE_ONLY" >/dev/null 2>&1 || true
+/bin/launchctl setenv APPLESILICON_FP8_MPS_WATERMARK "$APPLESILICON_FP8_MPS_WATERMARK" >/dev/null 2>&1 || true
 
 (sleep 1; /usr/bin/open "http://127.0.0.1:${PORT:-3300}/" >/dev/null 2>&1) &
 

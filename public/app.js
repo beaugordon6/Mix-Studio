@@ -165,6 +165,7 @@ const state = {
   folders: [],
   items: [],
   uploadedAssets: [],
+  elements: [],
   privateUnlocked: false,
   activeFolder: 'all',
   mediaFilter: 'all',
@@ -1188,6 +1189,7 @@ function promptDraftFromComposer() {
 function setPromptDraft(value, { render = true } = {}) {
   $('#prompt').value = value || '';
   if (render) renderPromptComposer();
+  renderPromptElements();
   if ($('#editSequenceBtn')) renderEditSequence();
   renderH3PromptGuideTrigger();
   if ($('#vidH3ReplacePanel')) renderH3Replacement();
@@ -1343,16 +1345,42 @@ function renderPromptMentionPicker() {
   const replacingH3Reference = h3Reference && promptMentionTargetToken?.isConnected;
   $('#promptMentionTitle').textContent = replacingH3Reference
     ? 'Change H3 reference'
-    : (h3Reference ? 'Reference an H3 input' : 'Reference an image');
+    : (h3Reference ? 'Reference an H3 input' : 'Add a reference or Element');
   $('#promptMentionCopy').textContent = replacingH3Reference
     ? 'Choose which reference input this card should use.'
     : h3Reference
     ? 'Choose a picture, video, or audio input to bind it to this prompt.'
-    : 'Choose an uploaded reference to add it to this prompt.';
+    : 'Choose a saved Element or uploaded reference to add it to this prompt.';
   const refs = h3Reference
     ? h3PromptReferenceEntries()
     : state.refs.map((ref, index) => ({ asset: ref, index, mediaKind: 'image', label: `Image ${index + 1}` })).filter(({ asset }) => asset);
-  if (!refs.length) {
+  if (!h3Reference) {
+    for (const element of state.elements || []) {
+      const option = document.createElement('button');
+      option.type = 'button';
+      option.className = 'prompt-mention-option';
+      const media = document.createElement('img');
+      media.src = `/api/input?name=${encodeURIComponent(element.assetNames[0])}`;
+      media.alt = '';
+      const copy = document.createElement('span');
+      const title = document.createElement('b');
+      title.textContent = element.handle;
+      const detail = document.createElement('small');
+      detail.textContent = `${element.type[0].toUpperCase()}${element.type.slice(1)} Element`;
+      copy.append(title, detail);
+      const add = document.createElement('i');
+      add.textContent = '+';
+      option.append(media, copy, add);
+      option.addEventListener('click', () => {
+        $('#promptMentionSheet').classList.remove('show');
+        insertPromptPlainText(`${element.handle} `);
+        promptMentionTargetToken = null;
+        saveForm();
+      });
+      list.appendChild(option);
+    }
+  }
+  if (!refs.length && (h3Reference || !(state.elements || []).length)) {
     list.innerHTML = `<div class="prompt-mention-empty">Add a reference ${h3Reference ? 'input' : 'image'} above first, then type <b>@</b> here to place it in the prompt.</div>`;
     return;
   }
@@ -12447,6 +12475,42 @@ $('#editSequenceBtn').addEventListener('click', () => {
 function updatePromptClear() {
   $('#promptClear').hidden = !promptDraft().trim();
 }
+
+function promptMentionsElement(handle) {
+  const escaped = String(handle || '').replace(/^@/, '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  return escaped && new RegExp(`(^|[^a-z0-9_-])@${escaped}\\b`, 'i').test(promptDraft());
+}
+
+function renderPromptElements() {
+  const list = $('#promptElementList');
+  if (!list) return;
+  const row = $('#promptElements');
+  if (row) row.hidden = state.view === 'video';
+  list.replaceChildren();
+  for (const element of state.elements || []) {
+    const mentioned = promptMentionsElement(element.handle);
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.className = 'prompt-element-chip' + (mentioned ? ' is-mentioned' : '');
+    button.setAttribute('aria-pressed', String(mentioned));
+    button.title = mentioned ? `Edit ${element.handle}` : `Add ${element.handle} to prompt`;
+    const image = document.createElement('img');
+    image.src = `/api/input?name=${encodeURIComponent(element.assetNames[0])}`;
+    image.alt = '';
+    const label = document.createElement('span');
+    label.textContent = element.handle;
+    button.append(image, label);
+    button.addEventListener('click', () => {
+      if (promptMentionsElement(element.handle)) return openElementEditor({ element });
+      const before = promptDraft();
+      setPromptDraft(`${before}${before && !/\s$/.test(before) ? ' ' : ''}${element.handle} `);
+      state.prompts[state.view] = promptDraft();
+      saveForm();
+      $('#promptComposer').focus();
+    });
+    list.appendChild(button);
+  }
+}
 $('#promptComposer').addEventListener('beforeinput', (event) => {
   if ((state.view === 'edit' || h3ReferenceModeActive()) && event.inputType === 'insertText' && event.data === '@') {
     event.preventDefault();
@@ -19120,6 +19184,7 @@ async function useGalleryItemAsGuide(item, mode = 'image') {
 function galleryImageDestinationActions(item, { includeReuse = true } = {}) {
   return [
     { label: 'Edit', detail: 'Use as an Edit reference', icon: 'edit', tone: 'edit', action: () => useAsRef(item) },
+    { label: 'Save as Element', detail: 'Reuse this look with an @name', icon: 'reuse', tone: 'reuse', action: () => openElementEditor({ item }) },
     { label: 'Image guide', detail: 'Start an image-to-image generation', icon: 'first-frame', tone: 'reuse', action: () => useGalleryItemAsGuide(item, 'image') },
     { label: 'Depth guide', detail: 'Preserve camera and scene structure', icon: 'depth', tone: 'reuse', action: () => useGalleryItemAsGuide(item, 'depth') },
     { label: 'First frame', detail: 'Start a video here', icon: 'first-frame', tone: 'video', action: () => sendToVideoTab(item, 'start') },
@@ -19127,6 +19192,116 @@ function galleryImageDestinationActions(item, { includeReuse = true } = {}) {
     includeReuse ? { label: 'Reuse', detail: 'Load generation settings', icon: 'reuse', tone: 'reuse', action: () => reuseItem(item) } : null,
   ].filter(Boolean);
 }
+
+let elementEditor = null;
+let elementPreviewUrl = '';
+
+function elementHandleSuggestion(value) {
+  return String(value || '').toLowerCase().replace(/^@+/, '').replace(/[^a-z0-9_-]+/g, '-').replace(/^-+|-+$/g, '').replace(/^[^a-z]+/, '').slice(0, 48) || 'new-element';
+}
+
+function setElementEditorType(type) {
+  const chosen = ['character', 'location', 'prop'].includes(type) ? type : 'character';
+  elementEditor.type = chosen;
+  $$('#elementTypeRow [data-element-type]').forEach((button) => {
+    button.setAttribute('aria-pressed', String(button.dataset.elementType === chosen));
+  });
+  try { localStorage.setItem('mix-last-element-type', chosen); } catch { /* optional preference */ }
+}
+
+function closeElementEditor() {
+  $('#elementSheet').classList.remove('show');
+  if (elementPreviewUrl) URL.revokeObjectURL(elementPreviewUrl);
+  elementPreviewUrl = '';
+  elementEditor = null;
+  syncSheetScrollLock();
+}
+
+function openElementEditor({ element = null, item = null } = {}) {
+  if (elementPreviewUrl) URL.revokeObjectURL(elementPreviewUrl);
+  elementPreviewUrl = '';
+  let rememberedType = 'character';
+  try { rememberedType = localStorage.getItem('mix-last-element-type') || rememberedType; } catch { /* optional preference */ }
+  elementEditor = { element, item, file: null, type: element?.type || rememberedType };
+  $('#elementImageInput').value = '';
+  $('#elementSheetTitle').textContent = element ? `Edit ${element.handle}` : 'New Element';
+  $('#elementHandle').value = element
+    ? String(element.handle || '').replace(/^@/, '')
+    : elementHandleSuggestion(item?.name || String(item?.prompt || '').split(/\s+/).slice(0, 3).join('-'));
+  const preview = $('#elementImagePreview');
+  const source = element?.assetNames?.[0]
+    ? `/api/input?name=${encodeURIComponent(element.assetNames[0])}`
+    : (item ? galleryImageSource(item) : '');
+  preview.hidden = !source;
+  preview.src = source;
+  $('#elementImageEmpty').hidden = !!source;
+  $('#elementDeleteBtn').hidden = !element;
+  setElementEditorType(elementEditor.type);
+  $('#elementSheet').classList.add('show');
+  syncSheetScrollLock();
+  if (!source) $('#elementImageInput').click();
+  else requestAnimationFrame(() => $('#elementHandle').select());
+}
+
+$('#elementAddBtn').addEventListener('click', () => openElementEditor());
+$('#elementImagePicker').addEventListener('click', () => $('#elementImageInput').click());
+$('#elementTypeRow').addEventListener('click', (event) => {
+  const button = event.target.closest('[data-element-type]');
+  if (button) setElementEditorType(button.dataset.elementType);
+});
+$('#elementImageInput').addEventListener('change', () => {
+  const file = $('#elementImageInput').files?.[0];
+  if (!file || !elementEditor) return;
+  if (!String(file.type || '').startsWith('image/')) return toast('Choose an image file', true);
+  if (elementPreviewUrl) URL.revokeObjectURL(elementPreviewUrl);
+  elementPreviewUrl = URL.createObjectURL(file);
+  elementEditor.file = file;
+  $('#elementImagePreview').src = elementPreviewUrl;
+  $('#elementImagePreview').hidden = false;
+  $('#elementImageEmpty').hidden = true;
+  if ($('#elementHandle').value === 'new-element') $('#elementHandle').value = elementHandleSuggestion(file.name.replace(/\.[^.]+$/, ''));
+  $('#elementHandle').select();
+});
+$('#elementSheet [data-close]').addEventListener('click', closeElementEditor);
+$('#elementForm').addEventListener('submit', async (event) => {
+  event.preventDefault();
+  if (!elementEditor) return;
+  const save = $('#elementSaveBtn');
+  save.disabled = true;
+  try {
+    let assetName = elementEditor.element?.assetNames?.[0] || '';
+    if (elementEditor.file) {
+      const uploaded = await uploadInputAsset(elementEditor.file, elementEditor.file.name || 'element.png', { catalog: true, quietComplete: true });
+      assetName = uploaded.name;
+    }
+    const result = await api('/api/elements', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        id: elementEditor.element?.id,
+        handle: $('#elementHandle').value,
+        type: elementEditor.type,
+        assetName,
+        sourceItemId: elementEditor.file ? undefined : elementEditor.item?.id,
+      }),
+    });
+    state.elements = [result.element, ...state.elements.filter((entry) => entry.id !== result.element.id)];
+    closeElementEditor();
+    renderPromptElements();
+    toast(`${result.element.handle} is ready to use`);
+  } catch (error) { toast(error.message, true); }
+  finally { save.disabled = false; }
+});
+$('#elementDeleteBtn').addEventListener('click', async () => {
+  const element = elementEditor?.element;
+  if (!element || !await askConfirm({ title: `Delete ${element.handle}?`, message: 'The source image will stay in Uploaded assets.', confirmLabel: 'Delete Element', danger: true })) return;
+  try {
+    await api(`/api/elements/${encodeURIComponent(element.id)}`, { method: 'DELETE' });
+    state.elements = state.elements.filter((entry) => entry.id !== element.id);
+    closeElementEditor();
+    renderPromptElements();
+    toast(`${element.handle} deleted`);
+  } catch (error) { toast(error.message, true); }
+});
 
 async function continueEditingResult(item) {
   try {
@@ -22435,6 +22610,12 @@ function connectEvents() {
     refreshGallery(true);
     queueRefreshSoon();
   });
+  es.addEventListener('jobRequeued', (ev) => {
+    const d = JSON.parse(ev.data);
+    if (d.profileId && (!state.profile || d.profileId !== state.profile.id)) return;
+    applyQueueJobMapping({ [d.jobId]: d.nextJobId });
+    queueRefreshSoon(true);
+  });
   es.addEventListener('videoChunkStep', (ev) => {
     const d = JSON.parse(ev.data);
     const longContext = d.sequenceKind === 'long-context';
@@ -22649,6 +22830,7 @@ function refreshGallery(soft, options = {}) {
       state.folders = data.folders;
       state.items = data.items;
       state.uploadedAssets = Array.isArray(data.uploadedAssets) ? data.uploadedAssets : [];
+      state.elements = Array.isArray(data.elements) ? data.elements : [];
       state.privateUnlocked = !!data.unlocked;
       galleryDataRevision = String(data.revision || '');
       if (!['all', 'uploaded-assets'].includes(state.activeFolder) && !state.folders.some((f) => f.id === state.activeFolder)) {
@@ -22659,6 +22841,7 @@ function refreshGallery(soft, options = {}) {
       void refreshLoraContext();
       renderFolders();
       renderGrid();
+      renderPromptElements();
       renderDesktopStage();
       updatePrivacyButton();
     } catch (e) {

@@ -33,8 +33,12 @@ test('uploadedAssetUsage scopes references to the owning profile', () => {
       { profileId: 'guest', info: { audioName: 'ks_voice.wav' } },
     ],
     jobs: [{ profileId: 'owner', params: { audioName: 'ks_voice.wav' } }],
+    elements: [
+      { profileId: 'owner', assetNames: ['ks_voice.wav'] },
+      { profileId: 'guest', assetNames: ['ks_voice.wav'] },
+    ],
   });
-  assert.deepEqual(usage, { savedGenerations: 1, activeJobs: 1, inUse: true });
+  assert.deepEqual(usage, { savedGenerations: 1, activeJobs: 1, elements: 1, inUse: true });
 });
 
 test('publicUploadedAsset excludes ownership and deletion metadata', () => {

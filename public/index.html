@@ -753,6 +753,10 @@
         <svg viewBox="0 0 24 24" width="17" height="17"><path fill="currentColor" d="M9 3h6l1 2h4v2H4V5h4l1-2Zm-3 6h12l-.9 11.1a2 2 0 0 1-2 1.9H8.9a2 2 0 0 1-2-1.9L6 9Zm4 2v8h1.5v-8H10Zm3.5 0v8H15v-8h-1.5Z"/></svg>
       </button>
     </div>
+    <div class="prompt-elements" id="promptElements" aria-label="Visual Elements">
+      <button class="prompt-element-add" id="elementAddBtn" type="button" aria-label="Create an Element">＋ Element</button>
+      <div class="prompt-element-list" id="promptElementList"></div>
+    </div>
     <div class="prompt-intent-hint" id="promptIntentHint" role="status" hidden>
       <span class="prompt-intent-icon" aria-hidden="true">
         <svg viewBox="0 0 24 24"><path fill="currentColor" d="M12 2a8 8 0 0 1 5.9 13.4L16 17.3V20H8v-2.7l-1.9-1.9A8 8 0 0 1 12 2Zm0 2a6 6 0 0 0-4.4 10.1l2.4 2.4V18h4v-1.5l2.4-2.4A6 6 0 0 0 12 4Zm-3 17h6v2H9v-2Z"/></svg>
@@ -2277,6 +2281,22 @@
     <div class="face-empty" id="faceEmpty" hidden>No saved faces yet — upload one below.</div>
     <button class="add-lora" id="faceUploadBtn">➕ Upload new face</button>
   </div>
+</div>
+
+<!-- Visual Element editor -->
+<div class="sheet centered-dialog-sheet" id="elementSheet">
+  <form class="sheet-panel element-sheet-panel" id="elementForm">
+    <h3 class="sheet-title"><span id="elementSheetTitle">New Element</span><button data-close type="button" aria-label="Close Element editor">✕</button></h3>
+    <p class="face-hint">Save this look once, then type or tap its @name in any image prompt.</p>
+    <button class="element-image-picker" id="elementImagePicker" type="button">
+      <img id="elementImagePreview" alt="" hidden />
+      <span id="elementImageEmpty"><b>Choose one image</b><small>Upload a clear reference</small></span>
+    </button>
+    <input id="elementImageInput" type="file" accept="image/*" hidden />
+    <div class="field element-handle-field"><label for="elementHandle">@ name</label><span><b>@</b><input id="elementHandle" type="text" maxlength="48" autocomplete="off" autocapitalize="none" autocorrect="off" spellcheck="false" placeholder="character-name" required /></span></div>
+    <div class="field"><label>Type</label><div class="element-type-row" id="elementTypeRow" role="radiogroup" aria-label="Element type"><button type="button" data-element-type="character" aria-pressed="true">Character</button><button type="button" data-element-type="location" aria-pressed="false">Location</button><button type="button" data-element-type="prop" aria-pressed="false">Prop</button></div></div>
+    <div class="element-form-actions"><button class="sheet-cta danger" id="elementDeleteBtn" type="button" hidden>Delete</button><button class="sheet-cta" id="elementSaveBtn" type="submit">Save Element</button></div>
+  </form>
 </div>
 
 <!-- queue sheet -->

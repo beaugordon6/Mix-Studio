@@ -101,6 +101,21 @@ test('macOS starts a source ComfyUI with Metal-safe launch settings', async () =
   }
 });
 
+test('macOS launcher primes the GUI environment used by Comfy Desktop', () => {
+  const launcher = fs.readFileSync(path.join(__dirname, '..', 'start.command'), 'utf8');
+  assert.match(launcher, /export PYTORCH_ENABLE_MPS_FALLBACK="\$\{PYTORCH_ENABLE_MPS_FALLBACK:-1\}"/);
+  assert.match(launcher, /\/bin\/launchctl setenv PYTORCH_ENABLE_MPS_FALLBACK "\$PYTORCH_ENABLE_MPS_FALLBACK"/);
+  assert.match(launcher, /export ASFP8_ENABLE_ONLY="\$\{ASFP8_ENABLE_ONLY:-int8_linear_kernel_mps,fused_norm_mps,rope_fast_mps\}"/);
+  assert.match(launcher, /\/bin\/launchctl setenv ASFP8_ENABLE_ONLY "\$ASFP8_ENABLE_ONLY"/);
+  assert.match(launcher, /export APPLESILICON_FP8_MPS_WATERMARK="\$\{APPLESILICON_FP8_MPS_WATERMARK:-off\}"/);
+});
+
+test('MPS int-mm failures are translated into an actionable idle restart message', () => {
+  const server = fs.readFileSync(path.join(__dirname, '..', 'server.js'), 'utf8');
+  assert.match(server, /aten::_int_mm\|not currently implemented for the MPS device/);
+  assert.match(server, /when the queues are idle, restart Comfy Desktop and try again/);
+});
+
 test('the Start API is owner-only, operation-safe, and separate from task-killing restart', () => {
   const server = fs.readFileSync(path.join(__dirname, '..', 'server.js'), 'utf8');
   const startRoute = server.slice(server.indexOf("route === '/api/comfy/start'"), server.indexOf("route === '/api/comfy/restart'"));

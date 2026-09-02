@@ -937,6 +937,34 @@ html:-webkit-full-screen { background: #000; }
 
 /* ---------------- prompt ---------------- */
 .prompt-box { position: relative; }
+.prompt-elements { display: flex; align-items: center; gap: 7px; min-width: 0; margin-top: 8px; }
+.prompt-element-list { display: flex; align-items: center; gap: 7px; min-width: 0; overflow-x: auto; scrollbar-width: none; }
+.prompt-element-list::-webkit-scrollbar { display: none; }
+.prompt-element-add,
+.prompt-element-chip { min-height: 34px; border: 1px solid var(--line); border-radius: 999px; background: rgba(255,255,255,.035); color: var(--ink-soft); font-size: 11px; font-weight: 850; white-space: nowrap; }
+.prompt-element-add { flex: 0 0 auto; padding: 0 12px; color: rgb(var(--mode-rgb)); border-color: rgba(var(--mode-rgb),.28); }
+.prompt-element-chip { display: inline-flex; align-items: center; gap: 7px; padding: 3px 10px 3px 4px; }
+.prompt-element-chip img { width: 26px; height: 26px; border-radius: 50%; object-fit: cover; }
+.prompt-element-chip.is-mentioned { color: var(--ink); border-color: rgba(var(--mode-rgb),.55); background: rgba(var(--mode-rgb),.11); }
+.prompt-element-chip:focus-visible,
+.prompt-element-add:focus-visible { outline: 2px solid rgba(var(--mode-rgb),.7); outline-offset: 2px; }
+
+.element-sheet-panel { width: min(440px, 100%); }
+.element-image-picker { width: 100%; aspect-ratio: 16 / 9; margin: 4px 0 18px; border: 1px dashed rgba(var(--mode-rgb),.4); border-radius: var(--radius-md); overflow: hidden; background: rgba(255,255,255,.025); color: var(--ink-soft); }
+.element-image-picker img { width: 100%; height: 100%; object-fit: contain; background: #050505; }
+.element-image-picker > span { height: 100%; display: grid; place-content: center; gap: 4px; text-align: center; }
+.element-image-picker b { font-size: 14px; }
+.element-image-picker small { color: var(--muted); font-size: 11px; }
+.element-handle-field > span { display: flex; align-items: center; border: 1px solid var(--line); border-radius: 10px; background: rgba(255,255,255,.03); }
+.element-handle-field > span:focus-within { border-color: rgba(var(--mode-rgb),.65); }
+.element-handle-field b { padding-left: 12px; color: rgb(var(--mode-rgb)); }
+.element-handle-field input { border: 0; background: transparent; padding-left: 2px; }
+.element-type-row { display: grid; grid-template-columns: repeat(3, 1fr); gap: 6px; }
+.element-type-row button { min-height: 40px; border: 1px solid var(--line); border-radius: 10px; background: rgba(255,255,255,.03); color: var(--muted); font-size: 12px; font-weight: 800; }
+.element-type-row button[aria-pressed="true"] { color: var(--ink); border-color: rgba(var(--mode-rgb),.55); background: rgba(var(--mode-rgb),.12); }
+.element-form-actions { display: flex; gap: 8px; margin-top: 18px; }
+.element-form-actions .sheet-cta { flex: 1; margin: 0; }
+.element-form-actions .danger { flex: 0 0 auto; }
 .prompt-source { display: none; }
 .prompt-composer {
   display: block;

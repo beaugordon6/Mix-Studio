@@ -209,6 +209,12 @@ const {
   uploadedAssetUsage,
   publicUploadedAsset,
 } = require('./lib/uploaded-assets');
+const {
+  normalizeElement,
+  publicElement,
+  resolvePromptElements,
+  replaceElementHandles,
+} = require('./lib/elements');
 const { normalizeEditSequence, supportsSequentialEdit } = require('./lib/edit-sequence');
 const { normalizeQwenEditQuality, qwenEditPreset } = require('./lib/qwen-edit');
 const { normalizeEditAngle, supportsEditAngles, editAnglePrompt } = require('./lib/edit-angle');
@@ -312,6 +318,7 @@ const {
   unreferencedAssetRefs,
 } = require('./lib/deleted-media');
 const { applyProfileOutputPrefix, profileOutputFolder } = require('./lib/output-prefix');
+const { createJobJournal } = require('./lib/job-journal');
 const { expandGalleryGroupSelection } = require('./lib/gallery-grouping');
 const { updateGalleryGroupName } = require('./lib/gallery-group-names');
 const {
@@ -846,6 +853,7 @@ if (!Array.isArray(db.loraPresets)) db.loraPresets = [];
 if (!Array.isArray(db.userPreferences)) db.userPreferences = [];
 if (!Array.isArray(db.faces)) db.faces = [];
 if (!Array.isArray(db.uploadedAssets)) db.uploadedAssets = [];
+if (!Array.isArray(db.elements)) db.elements = [];
 if (!Array.isArray(db.smartRuns)) db.smartRuns = [];
 const interruptedSmartRunIds = markSmartRunsInterruptedForRecovery(db.smartRuns);
 
@@ -998,7 +1006,22 @@ const CLIENT_ID = 'kreastudio-' + crypto.randomBytes(6).toString('hex');
 // replacement process even when a restart is too fast to produce a failed
 // network request.
 const SERVER_INSTANCE_ID = crypto.randomBytes(12).toString('hex');
-const jobs = new Map(); // promptId -> job
+const localJobJournal = createJobJournal(path.join(DATA, 'pending-jobs.json'));
+class DurableJobMap extends Map {
+  set(pid, job) {
+    const result = super.set(pid, job);
+    localJobJournal.put(pid, job);
+    return result;
+  }
+
+  delete(pid) {
+    const deleted = super.delete(pid);
+    if (deleted) localJobJournal.remove(pid);
+    return deleted;
+  }
+}
+const recoveredLocalJobs = localJobJournal.entries();
+const jobs = new DurableJobMap(recoveredLocalJobs); // promptId -> job
 const externalPromptPreflights = new Map(); // synthetic id -> external prompt enhancement
 const queueHealthState = { lowGpuSince: null };
 let dependencyInstallRunning = false;
@@ -1380,6 +1403,47 @@ function jobBaseTime(job) {
 
 function jobDurationMs(job, now = Date.now()) {
   return Math.max(0, now - jobBaseTime(job));
+}
+
+async function requeueMissingDurableJob(pid, job) {
+  if (!job || job.requeueing || !['gen', 'loraHunt'].includes(job.kind) || !job.graph) return false;
+  job.requeueing = true;
+  job.recoveryAttempts = Math.max(0, Number(job.recoveryAttempts) || 0) + 1;
+  broadcast('status', {
+    jobId: pid,
+    profileId: job.profileId,
+    kind: job.kind,
+    text: 'Recovering generation after ComfyUI restart…',
+    itemId: job.itemId || null,
+  });
+  try {
+    const nextPid = await queuePrompt(job.graph, { profileId: job.profileId });
+    jobs.delete(pid);
+    const replacement = Object.assign(job, {
+      enqueuedAt: Date.now(),
+      startedAt: null,
+      requeuedFrom: pid,
+      requeueing: false,
+    });
+    delete replacement.missingFromComfyAt;
+    trackJob(nextPid, replacement);
+    updateSmartChunkJob(replacement, nextPid, 0, 1);
+    ensureWs();
+    broadcast('jobRequeued', { jobId: pid, nextJobId: nextPid, profileId: job.profileId });
+    return true;
+  } catch (error) {
+    job.requeueing = false;
+    job.missingFromComfyAt = Date.now();
+    localJobJournal.put(pid, job);
+    broadcast('status', {
+      jobId: pid,
+      profileId: job.profileId,
+      kind: job.kind,
+      text: 'Waiting for ComfyUI to accept the preserved generation…',
+      itemId: job.itemId || null,
+    });
+    return false;
+  }
 }
 
 function queueEntryCreatedAt(entry) {
@@ -2243,7 +2307,11 @@ function handleWsMessage(msg) {
       ...progressPhaseForJob(job, d.node),
     });
   } else if (msg.type === 'execution_error' && pid && jobs.has(pid)) {
-    failJob(pid, (d.exception_message || 'execution error') + (d.node_type ? ` (${d.node_type})` : ''));
+    const rawMessage = (d.exception_message || 'execution error') + (d.node_type ? ` (${d.node_type})` : '');
+    const message = process.platform === 'darwin' && /aten::_int_mm|not currently implemented for the MPS device/i.test(rawMessage)
+      ? 'This INT8 model needs PyTorch CPU fallback on Apple silicon. Mix has enabled it for future launches; when the queues are idle, restart Comfy Desktop and try again. (KSampler)'
+      : rawMessage;
+    failJob(pid, message);
   } else if (msg.type === 'execution_interrupted' && pid && jobs.has(pid)) {
     const job = jobs.get(pid);
     if (job.cancelRequested) cancelJob(pid, job.cancelMessage || 'Cancelled');
@@ -2428,7 +2496,7 @@ async function completeStrengthHuntJob(pid, job, outputFiles, durationMs, textOu
       profileId: job.profileId,
       regions: Array.isArray(job.params.regions) && job.params.regions.length
         ? normalizeRegions(job.params.regions) : undefined,
-      prompt: job.params.prompt,
+      prompt: job.params.authoredPrompt || job.params.prompt,
       negativePrompt: job.params.negativePrompt || undefined,
       promptTemplate: job.params.promptTemplate,
       promptPresets: job.params.promptPresets,
@@ -2470,7 +2538,7 @@ async function completeStrengthHuntJob(pid, job, outputFiles, durationMs, textOu
   const documentationInfo = {
     columns: plan.columns,
     rows: plan.rows,
-    prompt: job.params.prompt,
+    prompt: job.params.authoredPrompt || job.params.prompt,
     seed: job.params.seed,
     cfg: job.params.cfg,
     steps: job.params.steps,
@@ -2523,7 +2591,7 @@ async function completeStrengthHuntJob(pid, job, outputFiles, durationMs, textOu
       count: created.length,
     },
     profileId: job.profileId,
-    prompt: job.params.prompt,
+    prompt: job.params.authoredPrompt || job.params.prompt,
     negativePrompt: job.params.negativePrompt || undefined,
     promptTemplate: job.params.promptTemplate,
     promptPresets: job.params.promptPresets,
@@ -3047,7 +3115,7 @@ async function completeJob(pid) {
       profileId: job.profileId,
       regions: Array.isArray(job.params.regions) && job.params.regions.length
         ? normalizeRegions(job.params.regions) : undefined,
-      prompt: job.params.prompt,
+      prompt: job.params.authoredPrompt || job.params.prompt,
       negativePrompt: job.params.negativePrompt || undefined,
       promptTemplate: job.params.promptTemplate,
       promptPresets: job.params.promptPresets,
@@ -3122,16 +3190,38 @@ setInterval(async () => {
   // ComfyUI's final executing(node:null) event. Reconcile video history even
   // while the socket looks healthy so a missed terminal event cannot strand it.
   const needsVideoReconciliation = [...jobs.values()].some((job) => job.kind === 'video');
-  if (socketOpen && !socketStale && !needsTextReconciliation && !needsVideoReconciliation) return;
+  const needsMissingJobReconciliation = [...jobs.values()].some((job) => job.provider !== 'runpod');
+  if (socketOpen && !socketStale && !needsTextReconciliation && !needsVideoReconciliation && !needsMissingJobReconciliation) return;
   if (socketStale) {
     resetComfyTransport();
     ensureWs();
   }
+  let livePromptIds = null;
   for (const pid of [...jobs.keys()]) {
     try {
       const hist = (await (await comfyFetch(`/history/${pid}`)).json())[pid];
       if (hist && hist.status && hist.status.completed) await completeJob(pid);
       else if (hist && hist.status && hist.status.status_str === 'error') failJob(pid, 'Execution error (see ComfyUI console)');
+      else {
+        const job = jobs.get(pid);
+        if (!job || job.provider === 'runpod') continue;
+        if (!livePromptIds) {
+          const queue = await (await comfyFetch('/queue')).json();
+          livePromptIds = new Set([...(queue.queue_running || []), ...(queue.queue_pending || [])]
+            .map((entry) => String(entry && entry[1] || '')).filter(Boolean));
+        }
+        if (livePromptIds.has(pid)) {
+          delete job.missingFromComfyAt;
+        } else if (!job.missingFromComfyAt) {
+          job.missingFromComfyAt = Date.now();
+        } else if (Date.now() - job.missingFromComfyAt >= 10_000) {
+          if (!await requeueMissingDurableJob(pid, job)) {
+            if (!['gen', 'loraHunt'].includes(job.kind)) {
+              failJob(pid, 'ComfyUI restarted before this operation completed. Its source settings are still available to retry.');
+            }
+          }
+        }
+      }
     } catch (error) {
       if (jobs.get(pid)?.completing) failJob(pid, error.message || 'Could not finalize ComfyUI output');
       // Otherwise ComfyUI is temporarily offline; retry on the next poll.
@@ -7173,6 +7263,7 @@ async function handleApi(req, res, url) {
       await fsp.rename(durable, path.join(TRASH, path.basename(durable))).catch(() => { /* noop */ });
     }
     db.uploadedAssets = db.uploadedAssets.filter((entry) => entry.profileId !== target.id);
+    db.elements = db.elements.filter((entry) => entry.profileId !== target.id);
     for (const f of db.faces.filter((x) => x.profileId === target.id)) await toTrash(FACES, f.file);
     db.faces = db.faces.filter((f) => f.profileId !== target.id);
     if (target.avatar) await toTrash(AVATARS, target.avatar);
@@ -8704,6 +8795,7 @@ async function handleApi(req, res, url) {
   if (route === '/api/generate' && req.method === 'POST') {
     const p = await readJsonBody(req);
     p.prompt = String(p.prompt || '').trim();
+    p.authoredPrompt = p.prompt;
     p.negativePrompt = normalizeNegativePrompt(p.negativePrompt);
     p.promptTemplate = (p.mode === 'edit' || p.mode === 't2i')
       ? String(p.promptTemplate || '').trim().slice(0, 8000) || undefined
@@ -8806,6 +8898,23 @@ async function handleApi(req, res, url) {
       const editEngines = ['qwen', 'klein9', 'krea2', 'krea2ref', 'krea2remix'];
       p.editEngine = editEngines.includes(p.editEngine) ? p.editEngine : 'klein4';
     }
+    const elementCapacity = p.mode === 'edit' ? (p.editEngine === 'krea2ref' ? 2 : 3) : 1;
+    const promptElements = resolvePromptElements(p.prompt, db.elements, req.profile.id, elementCapacity);
+    if (promptElements.overflowNames.length) {
+      return json(res, 400, { error: `This workflow supports up to ${elementCapacity} Element references. Remove one @mention and try again.` });
+    }
+    if (promptElements.elements.length) {
+      if (p.mode !== 'edit' && p.imageName && p.imageGuideMode !== 'image') {
+        return json(res, 400, { error: 'Elements can be combined with an image guide, but not a depth or style guide yet.' });
+      }
+      p.prompt = replaceElementHandles(p.prompt, promptElements.elements);
+      p.elementHandles = promptElements.elements.map((element) => `@${element.handle}`);
+      if (p.mode !== 'edit' && promptElements.referenceNames[0]) {
+        p.imageName = promptElements.referenceNames[0];
+        p.imageGuideMode = 'image';
+        p.denoise = 0.45;
+      }
+    }
     const usesKrea2Model = p.mode !== 'edit' || ['krea2', 'krea2ref', 'krea2remix'].includes(p.editEngine);
     if (usesKrea2Model) {
       const info = await getObjectInfo();
@@ -8857,11 +8966,13 @@ async function handleApi(req, res, url) {
       }
     }
 
-    const refNames = p.mode === 'edit'
-      ? (Array.isArray(p.refImages)
-        ? p.refImages.filter(Boolean).slice(0, p.editEngine === 'krea2ref' ? 2 : 3)
-        : [])
+    const explicitRefNames = p.mode === 'edit'
+      ? (Array.isArray(p.refImages) ? p.refImages.filter(Boolean) : [])
       : (p.imageName ? [p.imageName] : []);
+    const refNames = [...new Set([...explicitRefNames, ...promptElements.referenceNames])];
+    if (refNames.length > elementCapacity) {
+      return json(res, 400, { error: `This workflow supports up to ${elementCapacity} total image and Element references.` });
+    }
     if (p.mode !== 'edit') p.editSequence = undefined;
     if (p.mode === 'edit') {
       if (settings.features[EDIT_FEATURES[p.editEngine]] === false) {
@@ -11201,7 +11312,64 @@ async function handleApi(req, res, url) {
     const uploadedAssets = db.uploadedAssets
       .filter((asset) => asset.profileId === req.profile.id && !asset.deletedAt)
       .map(publicUploadedAsset);
-    return json(res, 200, Object.assign({ unlocked, uploadedAssets, profile: publicProfile(req.profile, db), revision }, view));
+    const elements = db.elements
+      .filter((element) => element.profileId === req.profile.id)
+      .map(publicElement);
+    return json(res, 200, Object.assign({ unlocked, uploadedAssets, elements, profile: publicProfile(req.profile, db), revision }, view));
+  }
+
+  if (route === '/api/elements' && req.method === 'POST') {
+    const body = await readJsonBody(req);
+    const existing = body.id
+      ? db.elements.find((entry) => entry.id === body.id && entry.profileId === req.profile.id)
+      : null;
+    if (body.id && !existing) return json(res, 404, { error: 'Element not found' });
+    let assetName = String(body.assetName || existing?.assetNames?.[0] || '').trim();
+    if (body.sourceItemId) {
+      const visible = galleryView(db, isPrivateUnlocked(req)).items.find((item) => (
+        item.id === body.sourceItemId && item.profileId === req.profile.id
+      ));
+      if (!visible) return json(res, 404, { error: 'Generation not found' });
+      const sourceFile = visible.upscaled || visible.file;
+      const source = await fsp.readFile(path.join(IMAGES, sourceFile));
+      const ext = path.extname(sourceFile) || '.png';
+      assetName = await uploadToComfy(source, `ks_element_${Date.now()}_${crypto.randomBytes(4).toString('hex')}${ext}`);
+      await fsp.writeFile(inputAssetPath(INPUTS, assetName), source);
+      db.uploadedAssets.push({
+        id: uid(), profileId: req.profile.id, name: assetName,
+        label: String(visible.name || body.handle || 'Element reference').slice(0, 240),
+        kind: 'image', size: source.length, createdAt: Date.now(),
+      });
+    }
+    const asset = db.uploadedAssets.find((entry) => (
+      entry.name === assetName && entry.profileId === req.profile.id && !entry.deletedAt && entry.kind === 'image'
+    ));
+    if (!asset) return json(res, 400, { error: 'Choose an uploaded image for this Element.' });
+    let normalized;
+    try {
+      normalized = normalizeElement({ handle: body.handle, type: body.type, label: body.label, assetNames: [assetName] }, req.profile.id);
+    } catch (error) {
+      return json(res, 400, { error: error.message });
+    }
+    const duplicate = db.elements.find((entry) => (
+      entry.profileId === req.profile.id && entry.id !== existing?.id && entry.handle === normalized.handle
+    ));
+    if (duplicate) return json(res, 409, { error: `@${normalized.handle} already exists.` });
+    const now = Date.now();
+    const element = existing || { id: uid(), createdAt: now };
+    Object.assign(element, normalized, { updatedAt: now });
+    if (!existing) db.elements.push(element);
+    saveDb();
+    return json(res, 200, { element: publicElement(element) });
+  }
+
+  const elementDelete = route.match(/^\/api\/elements\/([\w]+)$/);
+  if (elementDelete && req.method === 'DELETE') {
+    const index = db.elements.findIndex((entry) => entry.id === elementDelete[1] && entry.profileId === req.profile.id);
+    if (index < 0) return json(res, 404, { error: 'Element not found' });
+    db.elements.splice(index, 1);
+    saveDb();
+    return json(res, 200, { ok: true });
   }
 
   const uploadedAssetDelete = route.match(/^\/api\/uploaded-assets\/([\w]+)$/);
@@ -11210,11 +11378,12 @@ async function handleApi(req, res, url) {
       entry.id === uploadedAssetDelete[1] && entry.profileId === req.profile.id && !entry.deletedAt
     ));
     if (!asset) return json(res, 404, { error: 'Uploaded asset not found' });
-    const usage = uploadedAssetUsage(asset, { items: db.items, jobs: [...jobs.values()] });
+    const usage = uploadedAssetUsage(asset, { items: db.items, jobs: [...jobs.values()], elements: db.elements });
     if (usage.inUse) {
       const reasons = [];
       if (usage.savedGenerations) reasons.push(`${usage.savedGenerations} saved generation${usage.savedGenerations === 1 ? '' : 's'}`);
       if (usage.activeJobs) reasons.push(`${usage.activeJobs} active job${usage.activeJobs === 1 ? '' : 's'}`);
+      if (usage.elements) reasons.push(`${usage.elements} Element${usage.elements === 1 ? '' : 's'}`);
       return json(res, 409, {
         error: `This asset is still used by ${reasons.join(' and ')}. Remove those references before deleting it.`,
         code: 'asset_in_use',
@@ -12203,6 +12372,10 @@ server.listen(PORT, '0.0.0.0', () => {
   }
   console.log(`    Profile PIN: ${db.profiles[0]?.pinHash ? 'enabled' : 'not set (optional)'}`);
   console.log(`    ComfyUI: ${settings.comfyUrl}`);
+  if (recoveredLocalJobs.length) {
+    console.log(`    Queue: recovering ${recoveredLocalJobs.length} interrupted local job(s)`);
+    ensureWs();
+  }
   if (typeof WebSocket === 'undefined') {
     console.log('    Note: Node < 22 detected - live progress disabled (polling fallback).');
   }

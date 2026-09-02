@@ -30,7 +30,7 @@ test('Library has a virtual Uploaded assets collection with deletion controls', 
 
 test('cataloged upload and safe deletion APIs are wired server-side', () => {
   assert.match(server, /req\.headers\['x-asset-catalog'\] === '1'/);
-  assert.match(server, /uploadedAssetUsage\(asset, \{ items: db\.items, jobs: \[\.\.\.jobs\.values\(\)\] \}\)/);
+  assert.match(server, /uploadedAssetUsage\(asset, \{ items: db\.items, jobs: \[\.\.\.jobs\.values\(\)\], elements: db\.elements \}\)/);
   assert.match(server, /path\.join\(TRASH_ROOT, 'uploaded-assets', asset\.profileId\)/);
   assert.match(server, /asset\.deletedAt = Date\.now\(\)/);
 });
