@@ -21,7 +21,7 @@ test('ordinary Create, Edit, and Element jobs use the durable gallery adapter', 
   const eligibility = between(server, 'function durableGenerationFinalizationEligible(', 'function finalizationNeedsAttention(');
   const completion = between(server, 'async function completeJob(', '/* Polling fallback:');
   assert.match(eligibility, /job\?\.kind === 'gen'/);
-  assert.match(eligibility, /!job\.params\?\.postUpscale/);
+  assert.doesNotMatch(eligibility, /!job\.params\?\.postUpscale/);
   assert.match(eligibility, /!job\.params\?\.editSequence/);
   assert.match(completion, /createGalleryFinalizationManifest\(/);
   assert.match(completion, /durableGalleryFinalizer\.finalize\(/);
@@ -30,6 +30,8 @@ test('ordinary Create, Edit, and Element jobs use the durable gallery adapter', 
   assert.match(completion, /elementsUsed:/);
   assert.ok(completion.indexOf("submissionState: 'output_ready'") < completion.indexOf('downloadImageOutput(outputFile)'));
   assert.match(completion, /if \(!files\.length\)[\s\S]*durableGenerationFinalizationEligible\(pid, job\)[\s\S]*deferDurableFinalization/);
+  const settle = between(server, 'async function settleDurableGalleryResult(', 'async function resumeDurableGalleryFromLocal(');
+  assert.ok(settle.indexOf('await ensurePostUpscaleChildren(pid, job, created)') < settle.indexOf('jobs.delete(pid)'));
 });
 
 test('finalization checkpoints survive restart and prevent resubmission', () => {
@@ -37,7 +39,8 @@ test('finalization checkpoints survive restart and prevent resubmission', () => 
   const polling = between(server, '/* Polling fallback:', '/* Prompt enhance');
   assert.match(journal, /finalization: job\.finalization \|\| undefined/);
   assert.match(journal, /finalizationOutputs:/);
-  assert.match(requeue, /job\.finalization \|\| \['output_ready', 'finalizing', 'finalized'\]/);
+  assert.match(requeue, /job\.finalization \|\| job\.attachmentFinalization/);
+  assert.match(requeue, /\['output_ready', 'finalizing', 'finalized'\]/);
   assert.match(polling, /resumeDurableGalleryFromLocal/);
   assert.match(server, /stagedDurableOutput\([\s\S]*durableGalleryFinalizer\.finalize/);
 });

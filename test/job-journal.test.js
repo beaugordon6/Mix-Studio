@@ -64,6 +64,42 @@ test('gallery finalization checkpoints and record descriptors survive restart', 
   assert.equal(restored.finalizationRetryAt, 5678);
 });
 
+test('post-upscale child identity and attachment checkpoints survive restart', (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'mix-job-journal-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const file = path.join(root, 'pending.json');
+  const operationId = '8ecfc3f0-ea78-4e8e-b1e4-7fbf13e24a74';
+  const receipt = {
+    version: 1,
+    id: operationId,
+    parentId: '7ecfc3f0-ea78-4e8e-b1e4-7fbf13e24a74',
+    relation: 'post_upscale',
+    ordinal: 0,
+    profileId: 'owner',
+    state: 'output_ready',
+    revision: 4,
+  };
+  const job = {
+    kind: 'upscale', profileId: 'owner', params: { mode: 'upscale' }, graph: { save: {} },
+    operationId, promptId: operationId, submissionState: 'finalizing',
+    parentOperationId: receipt.parentId, parentReceiptId: receipt.id,
+    childReceipts: [receipt], itemId: 'item-1',
+    sourceAsset: { file: 'base.png', sha256: 'a'.repeat(64), bytes: 123 },
+    upscaleInfo: { engine: 'seedvr2', resolution: 2160 },
+    attachmentFinalization: { version: 1, operationId, phase: 'asset_ready' },
+    attachmentDescriptor: { history: { kind: 'upscale' } },
+  };
+  assert.equal(createJobJournal(file).put(operationId, job), true);
+  const restored = createJobJournal(file).entries()[0][1];
+  assert.equal(restored.kind, 'upscale');
+  assert.equal(restored.parentOperationId, receipt.parentId);
+  assert.deepEqual(restored.childReceipts, [receipt]);
+  assert.deepEqual(restored.sourceAsset, job.sourceAsset);
+  assert.deepEqual(restored.upscaleInfo, job.upscaleInfo);
+  assert.deepEqual(restored.attachmentFinalization, job.attachmentFinalization);
+  assert.deepEqual(restored.attachmentDescriptor, job.attachmentDescriptor);
+});
+
 test('legacy durable jobs adopt their journal key as stable operation identity', (t) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'mix-job-journal-'));
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));

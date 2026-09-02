@@ -330,6 +330,16 @@ const { createJobJournal } = require('./lib/job-journal');
 const { createGalleryFinalizationManifest, hashAsset } = require('./lib/gallery-finalization');
 const { atomicWriteFile, createGalleryFinalizationAdapter } = require('./lib/gallery-finalization-adapter');
 const { assertCompleteGeneratedImage } = require('./lib/generated-output-validation');
+const {
+  createCatalogAttachmentFinalizer,
+  createCatalogAttachmentReceipt,
+} = require('./lib/catalog-attachment-finalizer');
+const {
+  beginChildSubmission,
+  createChildReceipt,
+  markChildAwaitingRecovery,
+  transitionChildReceipt,
+} = require('./lib/child-operation-receipts');
 const { expandGalleryGroupSelection } = require('./lib/gallery-grouping');
 const { updateGalleryGroupName } = require('./lib/gallery-group-names');
 const {
