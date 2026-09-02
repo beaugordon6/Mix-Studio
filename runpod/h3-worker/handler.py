@@ -23,6 +23,26 @@ REQUIRED_CLASSES = {
     "VAEDecode", "VAEDecodeAudio", "CreateVideo", "SaveVideo",
 }
 
+# The SerfBoy volume already contains this complete Frames stack. Keep these
+# names configurable so a copied volume can opt into an equivalent exact set
+# without rebuilding the worker image or downloading models at cold start.
+REQUIRED_FRAME_MODELS = {
+    "diffusionModel": os.environ.get(
+        "MIX_H3_FRAME_MODEL", "minimax_h3_fl2va_pruned_int8_convrot.safetensors"),
+    "textEncoder": os.environ.get(
+        "MIX_H3_TEXT_ENCODER", "qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors"),
+    "videoVae": os.environ.get(
+        "MIX_H3_VIDEO_VAE", "minimax_h3_video_vae_fp16.safetensors"),
+    "audioVae": os.environ.get(
+        "MIX_H3_AUDIO_VAE", "minimax_h3_audio_vae_fp32.safetensors"),
+}
+
+MODEL_INPUTS = {
+    "UNETLoader": ("unet_name", "diffusionModel"),
+    "CLIPLoader": ("clip_name", "textEncoder"),
+    "VAELoader": ("vae_name", "vae"),
+}
+
 
 def request_json(path, method="GET", payload=None, timeout=60):
     data = json.dumps(payload).encode() if payload is not None else None
@@ -114,34 +134,104 @@ def publish(job_id, entries):
     return published
 
 
-def readiness():
-    info = request_json("/object_info", timeout=120)
+def combo_values(info, class_name, input_name):
+    definition = info.get(class_name) or {}
+    inputs = definition.get("input") or {}
+    field = (inputs.get("required") or {}).get(input_name)
+    if not isinstance(field, list) or not field or not isinstance(field[0], list):
+        return set()
+    return {str(value) for value in field[0]}
+
+
+def model_inventory(info):
+    unets = combo_values(info, "UNETLoader", "unet_name")
+    clips = combo_values(info, "CLIPLoader", "clip_name")
+    vaes = combo_values(info, "VAELoader", "vae_name")
+    available = {
+        "diffusionModel": REQUIRED_FRAME_MODELS["diffusionModel"] in unets,
+        "textEncoder": REQUIRED_FRAME_MODELS["textEncoder"] in clips,
+        "videoVae": REQUIRED_FRAME_MODELS["videoVae"] in vaes,
+        "audioVae": REQUIRED_FRAME_MODELS["audioVae"] in vaes,
+    }
+    return {
+        "required": dict(REQUIRED_FRAME_MODELS),
+        "available": available,
+        "missing": [REQUIRED_FRAME_MODELS[key] for key, found in available.items() if not found],
+    }
+
+
+def validate_workflow_models(graph, info):
+    """Refuse loader filenames ComfyUI did not register before staging inputs."""
+    missing = []
+    for node in (graph or {}).values():
+        if not isinstance(node, dict):
+            continue
+        class_name = node.get("class_type")
+        model_input = MODEL_INPUTS.get(class_name)
+        if not model_input:
+            continue
+        input_name, _kind = model_input
+        requested = (node.get("inputs") or {}).get(input_name)
+        if not isinstance(requested, str):
+            continue
+        if requested not in combo_values(info, class_name, input_name):
+            missing.append(requested)
+    if missing:
+        raise RuntimeError("H3 worker is missing workflow models: " + ", ".join(sorted(set(missing))))
+
+
+def readiness(info=None):
+    info = info or request_json("/object_info", timeout=120)
     missing = sorted(REQUIRED_CLASSES - set(info))
-    return {"manifestVersion": MANIFEST_VERSION, "ready": not missing, "missingNodes": missing}
+    inventory = model_inventory(info)
+    return {
+        "manifestVersion": MANIFEST_VERSION,
+        "ready": not missing and not inventory["missing"],
+        "mode": "frames",
+        "missingNodes": missing,
+        "models": inventory,
+    }
 
 
 def handler(job):
     request = job.get("input") or {}
-    if int(request.get("manifestVersion") or 0) != MANIFEST_VERSION:
-        raise ValueError("Mix Studio and worker manifest versions differ")
-    ready = readiness()
-    if not ready["ready"]:
-        raise RuntimeError("H3 worker is missing nodes: " + ", ".join(ready["missingNodes"]))
-    if request.get("probe") is True:
-        return {"refresh_worker": True, **ready}
     try:
+        if int(request.get("manifestVersion") or 0) != MANIFEST_VERSION:
+            raise ValueError("Mix Studio and worker manifest versions differ")
+        info = request_json("/object_info", timeout=120)
+        ready = readiness(info)
+        if not ready["ready"]:
+            reasons = []
+            if ready["missingNodes"]:
+                reasons.append("nodes: " + ", ".join(ready["missingNodes"]))
+            if ready["models"]["missing"]:
+                reasons.append("models: " + ", ".join(ready["models"]["missing"]))
+            raise RuntimeError("H3 Frames worker is not ready; missing " + "; ".join(reasons))
+        if request.get("probe") is True:
+            return {"refresh_worker": True, **ready}
+        graphs = request.get("graphs") or [request.get("workflow")]
+        if not graphs or any(not isinstance(graph, dict) for graph in graphs):
+            raise ValueError("H3 request has no workflow")
+        for graph in graphs:
+            validate_workflow_models(graph, info)
         runpod.serverless.progress_update(job, "Preparing H3 inputs…")
         download_inputs(request.get("inputs"))
         all_outputs = {}
-        graphs = request.get("graphs") or [request.get("workflow")]
         for index, graph in enumerate(graphs):
-            if not isinstance(graph, dict):
-                raise ValueError("H3 request has no workflow")
             runpod.serverless.progress_update(job, "Generating H3 segment %d/%d…" % (index + 1, len(graphs)))
             all_outputs.update(run_graph(job, graph))
         runpod.serverless.progress_update(job, "Uploading finished video…")
         assets = publish(job["id"], output_entries(all_outputs))
         return {"refresh_worker": True, "manifestVersion": MANIFEST_VERSION, "assets": assets}
+    except Exception as error:
+        # Return the application error with the refresh request so Mix can
+        # report a terminal failure and RunPod does not retain model state.
+        return {
+            "refresh_worker": True,
+            "manifestVersion": MANIFEST_VERSION,
+            "error": str(error),
+            "errorType": type(error).__name__,
+        }
     finally:
         for item in request.get("inputs") or []:
             try:

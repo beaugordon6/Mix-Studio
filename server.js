@@ -519,7 +519,7 @@ const DEFAULT_SETTINGS = {
   // Keep the identity workflow on its validated Krea 2 base. It must not
   // silently inherit whichever general-purpose model happens to be selected.
   krea2ElementUnet: 'krea2_turbo_fp8_scaled.safetensors',
-  krea2ElementLora: 'krea2_identity_edit_v1_2_r64.safetensors',
+  krea2ElementLora: 'krea2_identity_edit_v1_2.safetensors',
   depthAnythingV3Model: 'da3_large.safetensors',
   clip: 'Huihui-Qwen3-VL-4B-Instruct-abliterated-fp8_scaled.safetensors',
   clipType: 'krea2',
@@ -637,6 +637,12 @@ function normalizeSettings(s) {
   s.h3RefTurboLora = String(s.h3RefTurboLora || '').trim() || H3_TURBO_LORAS.referenceRecommended;
   s.hfEndpoint = normalizeHuggingFaceEndpoint(s.hfEndpoint);
   if (!String(s.krea2ElementUnet || '').trim()) s.krea2ElementUnet = DEFAULT_SETTINGS.krea2ElementUnet;
+  // A short-lived Elements build selected the rank-reduced LoRA even when the
+  // recommended full v1.2 dependency was already installed. Reuse the shared
+  // identity LoRA so setup cannot finish and immediately request a duplicate.
+  if (String(s.krea2ElementLora || '').trim() === 'krea2_identity_edit_v1_2_r64.safetensors') {
+    s.krea2ElementLora = DEFAULT_SETTINGS.krea2ElementLora;
+  }
   if (!s.klein4Unet) s.klein4Unet = s.kleinUnet || DEFAULT_SETTINGS.klein4Unet;
   if (!s.klein4Clip) s.klein4Clip = s.kleinClip || DEFAULT_SETTINGS.klein4Clip;
   if (!s.klein9Unet) s.klein9Unet = DEFAULT_SETTINGS.klein9Unet;
@@ -658,7 +664,10 @@ function normalizeSettings(s) {
 function migrateStoredSettings(value) {
   const stored = value && typeof value === 'object' ? Object.assign({}, value) : {};
   const version = Math.max(0, Math.round(Number(stored.settingsSchemaVersion) || 0));
-  const changed = version < SETTINGS_SCHEMA_VERSION;
+  const hadDuplicateElementLora = String(stored.krea2ElementLora || '').trim()
+    === 'krea2_identity_edit_v1_2_r64.safetensors';
+  if (hadDuplicateElementLora) stored.krea2ElementLora = DEFAULT_SETTINGS.krea2ElementLora;
+  const changed = version < SETTINGS_SCHEMA_VERSION || hadDuplicateElementLora;
   // Schema v3 makes the selected Turbo filename authoritative. In particular,
   // keep the original ckpt850 four-step adapter when an existing install or a
   // user explicitly selects it; only brand-new settings inherit the v4 default.
