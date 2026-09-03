@@ -80,6 +80,7 @@ const { restartComfy, restartStatus, startComfy, startStatus } = require('./lib/
 const { discoverComfyEndpoints, probeComfyUrl } = require('./lib/comfy-discovery');
 const { assertVerifiedComfyRuntime, attestComfyEndpoint } = require('./lib/comfy-runtime-identity');
 const { createComfyAvailabilitySupervisor } = require('./lib/comfy-availability-supervisor');
+const { createIncidentLedger, incidentPhaseForCode } = require('./lib/incident-ledger');
 const {
   createQueueReorderReceipt,
   planQueueReorder,
@@ -474,6 +475,7 @@ const INPUTS = path.join(DATA, 'inputs');
 const DURABLE_INPUT_ASSETS = path.join(DATA, 'durable-input-assets');
 const DURABLE_INPUT_MANIFESTS = path.join(DATA, 'durable-input-manifests');
 const DURABLE_INPUT_DELETIONS = path.join(DATA, 'durable-input-deletions');
+const INCIDENT_LEDGER_FILE = path.join(DATA, 'diagnostics', 'incidents.jsonl');
 const QUEUE_REORDER_FILE = path.join(DATA, 'queue-reorder.json');
 const FINALIZATION_STAGING = path.join(DATA, 'finalization-staging');
 const TRASH_ROOT = path.join(DATA, 'trash');
@@ -491,6 +493,7 @@ fs.mkdirSync(DURABLE_INPUT_DELETIONS, { recursive: true });
 fs.mkdirSync(FINALIZATION_STAGING, { recursive: true });
 fs.mkdirSync(TRASH_ROOT, { recursive: true });
 fs.mkdirSync(PROMPT_PACKS, { recursive: true });
+const incidentLedger = createIncidentLedger({ file: INCIDENT_LEDGER_FILE });
 const FACES = path.join(DATA, 'faces');
 fs.mkdirSync(FACES, { recursive: true });
 const AVATARS = path.join(DATA, 'avatars');
@@ -1326,6 +1329,8 @@ let comfySetupExpectedBasePath = '';
 let comfyStartRunning = false;
 let comfyAvailabilitySupervisor = null;
 let comfySupervisorState = null;
+let lastComfyRuntimeAttestation = null;
+let previousComfySupervisorStatus = '';
 const comfyRecoveryContext = new AsyncLocalStorage();
 let comfyStartState = {
   state: 'idle',
@@ -1913,7 +1918,39 @@ async function verifyConfiguredComfyRuntime() {
     comfyCompatibilityAt = 0;
   }
   objectInfoRuntimeInstanceId = attestation.observed.instanceId;
+  lastComfyRuntimeAttestation = attestation;
   return attestation;
+}
+
+function incidentRuntimeFingerprint() {
+  if (lastComfyRuntimeAttestation) {
+    return {
+      ...lastComfyRuntimeAttestation,
+      endpoint: settings.comfyUrl,
+    };
+  }
+  return {
+    installId: RUNTIME?.comfy?.installId || RUNTIME?.installId || '',
+    instanceId: objectInfoRuntimeInstanceId,
+    endpoint: settings.comfyUrl,
+  };
+}
+
+function stableIncidentCode(value, fallback = 'unclassified_server_error') {
+  const code = String(value || '').trim().toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_+|_+$/g, '');
+  return /^[a-z][a-z0-9_]{1,95}$/.test(code) ? code : fallback;
+}
+
+function recordIncident(source) {
+  try {
+    return incidentLedger.record({
+      ...source,
+      runtimeFingerprint: incidentRuntimeFingerprint(),
+    });
+  } catch (error) {
+    console.warn('[incident-ledger]', String(error?.code || 'write_failed'));
+    return null;
+  }
 }
 
 async function reconcilePreservedJobsAfterComfyRecovery() {
@@ -2014,16 +2051,34 @@ function getComfyAvailabilitySupervisor() {
     readinessChecksPerAttempt: 180,
     readinessIntervalMs: 1000,
     onState: (next) => {
+      const priorStatus = previousComfySupervisorStatus;
+      previousComfySupervisorStatus = next.status;
       comfySupervisorState = next;
       if (['starting', 'waiting', 'backoff'].includes(next.status)) comfyStartRunning = true;
       if (['connected', 'attention'].includes(next.status)) comfyStartRunning = false;
       broadcast('comfyAvailability', next);
       if (next.status === 'connected') {
+        if (priorStatus && priorStatus !== 'connected') {
+          recordIncident({
+            phase: 'recovery',
+            code: 'comfy_recovered',
+            severity: 'info',
+            recoveryOutcome: 'recovered',
+            context: { availabilityState: next.status },
+          });
+        }
         updateComfyStartState({
           state: 'complete', phase: 'connected', message: next.message,
           error: null, matches: [],
         });
       } else if (next.status === 'attention') {
+        recordIncident({
+          phase: 'recovery',
+          code: stableIncidentCode(next.code, 'comfy_recovery_attention'),
+          severity: 'blocking',
+          recoveryOutcome: 'attention_required',
+          context: { availabilityState: next.status },
+        });
         updateComfyStartState({
           state: 'error', phase: 'attention', message: next.message,
           error: next.message, matches: [],
@@ -8972,6 +9027,22 @@ async function handleApi(req, res, url) {
   // can manage everyone.
   const isAdmin = () => profile && db.profiles[0] && profile.id === db.profiles[0].id;
   const canManage = (target) => profile && target && (profile.id === target.id || isAdmin());
+  if (route === '/api/support-bundle' && req.method === 'GET') {
+    if (!isAdmin()) {
+      return json(res, 403, { error: 'Only the owner profile can download support diagnostics.', code: 'owner_required' });
+    }
+    const bundle = incidentLedger.exportSupportBundle({
+      appVersion: readAppRelease(ROOT).version,
+      runtimeFingerprint: incidentRuntimeFingerprint(),
+      diagnostics: {
+        availabilityState: comfySupervisorState?.status || 'unknown',
+        queuePending: jobs.size,
+      },
+    });
+    const day = new Date().toISOString().slice(0, 10);
+    res.setHeader('Content-Disposition', `attachment; filename="mix-studio-support-${day}.json"`);
+    return json(res, 200, bundle);
+  }
   const profAvatar = route.match(/^\/api\/profiles\/([\w]+)\/avatar$/);
   if (profAvatar && req.method === 'POST') {
     const target = db.profiles.find((p) => p.id === profAvatar[1]);
@@ -14223,6 +14294,9 @@ async function handleSparkMcp(req, res, url) {
 
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, 'http://localhost');
+  const correlationId = crypto.randomUUID();
+  req.correlationId = correlationId;
+  res.setHeader('X-Mix-Correlation-ID', correlationId);
   try {
     if (url.pathname.startsWith('/mcp/')) return await handleSparkMcp(req, res, url);
     if (url.pathname.startsWith('/api/')) {
@@ -14299,11 +14373,31 @@ const server = http.createServer(async (req, res) => {
       ? 409
       : (Number.isInteger(explicitStatus) && explicitStatus >= 400 && explicitStatus <= 599 ? explicitStatus : 500);
     const loggedPath = url.pathname.startsWith('/mcp/') ? '/mcp/[redacted]' : url.pathname;
-    if (!cancelled) console.error('[error]', req.method, loggedPath, e.message);
+    const incidentCode = stableIncidentCode(cancelled ? 'job_cancelled' : e?.code);
+    if (!cancelled) {
+      console.error('[error]', correlationId, req.method, loggedPath, e.message);
+      const recoverable = comfyErrorCanRecover(e);
+      recordIncident({
+        phase: incidentPhaseForCode(incidentCode, loggedPath),
+        code: incidentCode,
+        severity: responseStatus >= 500 ? 'blocking' : 'warning',
+        correlationId,
+        recoveryOutcome: recoverable ? 'pending' : 'not_attempted',
+        context: {
+          method: req.method,
+          route: loggedPath,
+          httpStatus: responseStatus,
+          availabilityState: comfySupervisorState?.status || 'unknown',
+          queuePending: jobs.size,
+        },
+        error: e,
+      });
+    }
     if (!res.headersSent) {
       json(res, responseStatus, {
         error: String(e.message || e),
-        code: cancelled ? 'job_cancelled' : (e && e.code ? e.code : undefined),
+        code: incidentCode,
+        correlationId,
       });
     }
   }
