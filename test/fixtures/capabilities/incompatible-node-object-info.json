@@ -1,0 +1,9 @@
+{
+  "UNETLoader": {"input":{"required":{"unet_name":["COMBO",{"options":["krea2_turbo_fp8_scaled.safetensors"]}],"weight_dtype":["COMBO",{"options":["default","fp8_e4m3fn"]}]}},"output":["MODEL"]},
+  "CLIPLoader": {"input":{"required":{"clip_name":["COMBO",{"options":["Huihui-Qwen3-VL-4B-Instruct-abliterated-fp8_scaled.safetensors"]}],"type":["COMBO",{"options":["krea2","stable_diffusion"]}]}},"output":["CLIP"]},
+  "VAELoader": {"input":{"required":{"vae_name":["COMBO",{"options":["qwen_image_vae.safetensors"]}]}},"output":["VAE"]},
+  "LoraLoaderModelOnly": {"input":{"required":{"model":["MODEL"],"lora_name":["COMBO",{"options":["krea2_identity_edit_v1_2.safetensors"]}],"strength_model":["FLOAT",{"default":1.0}]}},"output":["MODEL"]},
+  "Krea2EditModelPatch": {"input":{"required":{"model":["MODEL"],"source_latent":["LATENT"],"vae":["VAE"],"fit_mode":["COMBO",{"options":["fit","crop (legacy)"]}]},"optional":{"ref_boost":["FLOAT",{"default":4.0}]}},"output":["MODEL"]},
+  "Krea2EditGroundedEncode": {"input":{"required":{"clip":["CLIP"],"prompt":["STRING"],"image":["IMAGE"],"grounding_px":["INT",{"default":768}]}},"output":["CONDITIONING"]},
+  "Krea2EditRebalance": {"input":{"required":{"text":["STRING"],"clip":["CLIP"],"steering":["FLOAT"],"layer_multiplier":["FLOAT"],"enable_step":["BOOLEAN"],"image1":["IMAGE"]}},"output":["CONDITIONING"]}
+}
